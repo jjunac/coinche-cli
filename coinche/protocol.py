@@ -73,8 +73,9 @@ REQUIRED_FIELDS: dict[str, set[str]] = {
     PLAY_CARD: {"card"},
     CHAT: {"text"},
 }
-# JOIN also accepts an optional "preferred_partner" field (a player name to try to
-# be seated on the same team as, best-effort; see Table.add_player).
+# JOIN also accepts an optional "team_name" field (a free-text label, e.g. "A"/"B",
+# shared with a teammate to try to be seated on the same team, best-effort; see
+# Table.add_player).
 
 _VALID_BID_ACTIONS = {"pass", "bid", "coinche", "surcoinche"}
 

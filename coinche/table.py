@@ -33,6 +33,7 @@ class ClientSession:
     name: str
     writer: asyncio.StreamWriter | None
     connected: bool = True
+    team_name: str | None = None
 
 
 class Table:
@@ -46,14 +47,16 @@ class Table:
         self.game: Game | None = None
 
     def add_player(
-        self, name: str, writer: asyncio.StreamWriter | None, preferred_partner: str | None = None
+        self, name: str, writer: asyncio.StreamWriter | None, team_name: str | None = None
     ) -> Seat:
         """Seat a new player (A14/A15). Raises TableError subclasses on rejection.
 
-        If `preferred_partner` names another already-seated player (case-insensitive),
-        best-effort seat this player on the same team: the empty seat opposite that
-        partner (per `PARTNER_OF`) is tried first, falling back to normal seat-filling
-        order (A17) when the partner isn't found or their partner seat isn't free.
+        `team_name` is a free-text, optional label (e.g. "A"/"B" or any name) shared
+        by teammates instead of naming each other directly. If it matches (case-
+        insensitive, trimmed) another already-seated player's `team_name`, best-effort
+        seat this player on the same team: the empty seat opposite that teammate (per
+        `PARTNER_OF`) is tried first, falling back to normal seat-filling order (A17)
+        when no match is found or that seat isn't free.
         """
         if self.game is not None:
             raise GameInProgressError(self.table_key)
@@ -62,13 +65,18 @@ class Table:
             if session is not None and session.connected and session.name.lower() == name.lower():
                 raise NameTakenError(name)
 
-        if preferred_partner:
+        normalized_team = team_name.strip().lower() if team_name else None
+        if normalized_team:
             for seat, session in self.seats.items():
-                if session is not None and session.name.lower() == preferred_partner.strip().lower():
+                if (
+                    session is not None
+                    and session.team_name is not None
+                    and session.team_name.strip().lower() == normalized_team
+                ):
                     partner_seat = PARTNER_OF[seat]
                     if self.seats[partner_seat] is None:
                         self.seats[partner_seat] = ClientSession(
-                            seat=partner_seat, name=name, writer=writer, connected=True
+                            seat=partner_seat, name=name, writer=writer, connected=True, team_name=team_name
                         )
                         if all(s is not None for s in self.seats.values()):
                             self.game = Game(target_score=self.target_score)
@@ -77,7 +85,7 @@ class Table:
 
         for seat in SEAT_ORDER:
             if self.seats[seat] is None:
-                self.seats[seat] = ClientSession(seat=seat, name=name, writer=writer, connected=True)
+                self.seats[seat] = ClientSession(seat=seat, name=name, writer=writer, connected=True, team_name=team_name)
                 if all(s is not None for s in self.seats.values()):
                     self.game = Game(target_score=self.target_score)
                 return seat

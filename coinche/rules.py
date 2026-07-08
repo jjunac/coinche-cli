@@ -1,8 +1,9 @@
 """Coinche rules: point tables, bid legality, card legality, trick winner, scoring.
 
-Implements assumptions A5-A13 from plan.md. Sans-Atout (no-trump) is explicitly
-NOT a legal declaration in this game (A7) — the only trump declarations are one
-of the 4 suits, "tout_atout", or "capot" (bid within a suit or tout_atout).
+Implements assumptions A5-A13 from plan.md. Sans-Atout (no-trump) and
+Tout-Atout (all-trump) are explicitly NOT legal declarations in this game
+(A7) — the only trump declarations are one of the 4 suits, or "capot" (bid
+within a chosen suit).
 """
 
 from __future__ import annotations
@@ -43,7 +44,7 @@ BID_MIN = 80
 BID_MAX = 180
 BID_STEP = 10
 CAPOT = "capot"
-ALLOWED_TRUMPS: tuple[str, ...] = (*SUITS, "tout_atout")
+ALLOWED_TRUMPS: tuple[str, ...] = SUITS
 
 CAPOT_BONUS = 250  # A8
 COINCHE_MULTIPLIER = 2  # A9
@@ -52,24 +53,16 @@ BELOTE_BONUS = 20  # A11
 DIX_DE_DER = 10  # last-trick bonus, folded into captured points by callers
 
 NORMAL_POOL = 162  # 152 card points + 10 dix-de-der (A10)
-TOUT_ATOUT_POOL = 258  # 4 x 62 + 10 dix-de-der (A7/A10)
 
 DEFAULT_TARGET_SCORE = 1000  # A12
 
 
-def card_points(card: Card, trump_suit: str | None, declaration: str) -> int:
-    """Return a card's point value for the given declaration.
-
-    `declaration` is one of "normal" (one suit is trump, the other 3 use
-    NONTRUMP_POINTS) or "tout_atout" (all 4 suits use TRUMP_POINTS).
-    """
-    if declaration == "tout_atout":
+def card_points(card: Card, trump_suit: str) -> int:
+    """Return a card's point value: TRUMP_POINTS if `card` is in the trump
+    suit, NONTRUMP_POINTS otherwise."""
+    if card.suit == trump_suit:
         return TRUMP_POINTS[card.rank]
-    if declaration == "normal":
-        if card.suit == trump_suit:
-            return TRUMP_POINTS[card.rank]
-        return NONTRUMP_POINTS[card.rank]
-    raise ValueError(f"Unknown declaration: {declaration!r}")
+    return NONTRUMP_POINTS[card.rank]
 
 
 # --- Bidding legality (A5/A6) -------------------------------------------------
@@ -134,16 +127,12 @@ def is_valid_bid(new_bid: dict, current_highest_bid: dict | None) -> bool:
 def legal_cards_to_play(
     hand: list[Card],
     current_trick: list[tuple[Seat, Card]],
-    trump_suit: str | None,
+    trump_suit: str,
     led_suit: str | None,
     player_seat: Seat | None = None,
     partner_seat: Seat | None = None,
 ) -> list[Card]:
     """Return the subset of `hand` legal to play next.
-
-    `trump_suit` is None for a "tout_atout" declaration: no suit cuts another,
-    players simply follow suit if able or discard freely otherwise (A7 only
-    changes point values, not trick-cutting mechanics for tout_atout).
 
     Enforces: follow-suit -> must-trump -> must-overtrump -> under-trump
     exception when the partner holds the trick's current highest trump ->
@@ -156,12 +145,6 @@ def legal_cards_to_play(
         led_suit = current_trick[0][1].suit
 
     same_suit_cards = [c for c in hand if c.suit == led_suit]
-
-    if trump_suit is None:
-        # Tout-atout: no suit is designated as trump for cutting purposes.
-        if same_suit_cards:
-            return same_suit_cards
-        return list(hand)
 
     if led_suit == trump_suit:
         if same_suit_cards:
@@ -210,24 +193,22 @@ def _apply_overtrump_rule(
 
 def trick_winner(
     trick: list[tuple[Seat, Card]],
-    trump_suit: str | None,
+    trump_suit: str,
     led_suit: str | None = None,
 ) -> Seat:
     """Return the seat that wins the trick."""
     if led_suit is None:
         led_suit = trick[0][1].suit
 
-    if trump_suit is not None:
-        trump_plays = [(s, c) for s, c in trick if c.suit == trump_suit]
-        if trump_plays:
-            winner_seat, _ = max(
-                trump_plays, key=lambda sc: TRUMP_ORDER.index(sc[1].rank)
-            )
-            return winner_seat
+    trump_plays = [(s, c) for s, c in trick if c.suit == trump_suit]
+    if trump_plays:
+        winner_seat, _ = max(
+            trump_plays, key=lambda sc: TRUMP_ORDER.index(sc[1].rank)
+        )
+        return winner_seat
 
     led_plays = [(s, c) for s, c in trick if c.suit == led_suit]
-    order = TRUMP_ORDER if trump_suit is None else NONTRUMP_ORDER
-    winner_seat, _ = max(led_plays, key=lambda sc: order.index(sc[1].rank))
+    winner_seat, _ = max(led_plays, key=lambda sc: NONTRUMP_ORDER.index(sc[1].rank))
     return winner_seat
 
 
@@ -252,8 +233,7 @@ def score_round(
     """
     attacking_team = bid["team"]
     defending_team = "EW" if attacking_team == "NS" else "NS"
-    declaration = "tout_atout" if bid["trump"] == "tout_atout" else "normal"
-    pool = TOUT_ATOUT_POOL if declaration == "tout_atout" else NORMAL_POOL
+    pool = NORMAL_POOL
 
     belote_bonus = {"NS": 0, "EW": 0}
     if belote_holder is not None:

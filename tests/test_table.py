@@ -62,32 +62,32 @@ def test_add_player_rejects_when_table_somehow_full_without_game():
         table.add_player("Eve", FakeWriter())
 
 
-def test_add_player_with_preferred_partner_seats_on_the_opposite_seat():
+def test_add_player_with_matching_team_name_seats_on_the_opposite_seat():
     table = Table("abcd")
-    table.add_player("Alice", FakeWriter())  # seated at N
-    seat = table.add_player("Bob", FakeWriter(), preferred_partner="Alice")
+    table.add_player("Alice", FakeWriter(), team_name="A")  # seated at N
+    seat = table.add_player("Bob", FakeWriter(), team_name="A")
     assert seat == Seat.S  # PARTNER_OF[N] == S
 
 
-def test_add_player_with_preferred_partner_is_case_insensitive_and_trims_whitespace():
+def test_add_player_with_matching_team_name_is_case_insensitive_and_trims_whitespace():
     table = Table("abcd")
-    table.add_player("Alice", FakeWriter())  # seated at N
-    seat = table.add_player("Bob", FakeWriter(), preferred_partner="  alice  ")
+    table.add_player("Alice", FakeWriter(), team_name="Team Rocket")  # seated at N
+    seat = table.add_player("Bob", FakeWriter(), team_name="  team rocket  ")
     assert seat == Seat.S
 
 
-def test_add_player_with_unknown_preferred_partner_falls_back_to_normal_order():
+def test_add_player_with_unmatched_team_name_falls_back_to_normal_order():
     table = Table("abcd")
-    seat = table.add_player("Bob", FakeWriter(), preferred_partner="NoSuchPlayer")
+    seat = table.add_player("Bob", FakeWriter(), team_name="B")
     assert seat == Seat.N
 
 
-def test_add_player_with_preferred_partner_whose_seat_is_taken_falls_back_to_normal_order():
+def test_add_player_with_matching_team_name_whose_seat_is_taken_falls_back_to_normal_order():
     table = Table("abcd")
-    table.add_player("Alice", FakeWriter())  # N
+    table.add_player("Alice", FakeWriter(), team_name="A")  # N
     table.add_player("Zoe", FakeWriter())  # E
     table.add_player("Carol", FakeWriter())  # S (Alice's partner seat, taken first)
-    seat = table.add_player("Bob", FakeWriter(), preferred_partner="Alice")
+    seat = table.add_player("Bob", FakeWriter(), team_name="A")
     assert seat == Seat.W  # partner seat (S) already taken: normal seat-filling order
 
 

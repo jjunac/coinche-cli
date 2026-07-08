@@ -105,19 +105,40 @@ def test_render_bid_menu_offers_one_select_trump_entry_per_distinct_trump():
     legal_actions = [
         {"trump": "♠", "points": 80},
         {"trump": "♠", "points": 90},
-        {"trump": "tout_atout", "points": "capot"},
+        {"trump": "♥", "points": 80},
     ]
     menu_text, tokens = render_bid_menu(legal_actions, current_highest_bid=None)
-    assert "Tout Atout" in menu_text
     select_trump_tokens = [c for c in tokens.values() if c.get("action") == "select_trump"]
     # One entry per distinct trump, not one per point level: 2 entries, not 3.
     assert select_trump_tokens == [
         {"action": "select_trump", "trump": "♠"},
-        {"action": "select_trump", "trump": "tout_atout"},
+        {"action": "select_trump", "trump": "♥"},
     ]
     # Point values are never enumerated in this stage-1 menu.
     assert "80" not in menu_text
     assert "Capot" not in menu_text
+
+
+def test_render_bid_menu_suit_tokens_are_stable_regardless_of_coinche_surcoinche():
+    # The four suits must always land on the same token numbers (2-5), whether
+    # or not Coinche/Surcoinche are on offer -- those are appended last instead
+    # of being inserted before the suits.
+    legal_actions = [
+        {"trump": "♠", "points": 80},
+        {"trump": "♥", "points": 80},
+        {"trump": "♦", "points": 80},
+        {"trump": "♣", "points": 80},
+    ]
+    _, tokens_no_extras = render_bid_menu(legal_actions, current_highest_bid=None)
+    _, tokens_with_extras = render_bid_menu(
+        legal_actions, current_highest_bid=None, can_coinche=True, can_surcoinche=True
+    )
+    for tok in ("2", "3", "4", "5"):
+        assert tokens_no_extras[tok] == tokens_with_extras[tok]
+    assert tokens_no_extras["2"] == {"action": "select_trump", "trump": "♠"}
+    assert tokens_no_extras["5"] == {"action": "select_trump", "trump": "♣"}
+    assert tokens_with_extras["6"] == {"action": "coinche"}
+    assert tokens_with_extras["7"] == {"action": "surcoinche"}
 
 
 def test_render_bid_value_prompt_lists_range_and_capot_for_chosen_trump():

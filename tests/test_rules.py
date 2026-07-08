@@ -1,13 +1,10 @@
 """Tests for coinche.rules: point tables, bid legality, card legality, scoring."""
 
-import pytest
-
 from coinche.cards import Card, Seat
 from coinche.rules import (
     ALLOWED_TRUMPS,
     CAPOT,
     NORMAL_POOL,
-    TOUT_ATOUT_POOL,
     card_points,
     is_valid_bid,
     legal_bid_actions,
@@ -21,25 +18,14 @@ from coinche.rules import (
 
 
 def test_card_points_normal_trump_suit():
-    assert card_points(Card("V", "♠"), "♠", "normal") == 20
-    assert card_points(Card("9", "♠"), "♠", "normal") == 14
-    assert card_points(Card("A", "♠"), "♠", "normal") == 11
+    assert card_points(Card("V", "♠"), "♠") == 20
+    assert card_points(Card("9", "♠"), "♠") == 14
+    assert card_points(Card("A", "♠"), "♠") == 11
 
 
 def test_card_points_normal_non_trump_suit():
-    assert card_points(Card("A", "♥"), "♠", "normal") == 11
-    assert card_points(Card("V", "♥"), "♠", "normal") == 2  # jack is non-trump here
-
-
-def test_card_points_tout_atout_uses_trump_ladder_for_all_suits():
-    for suit in ("♠", "♥", "♦", "♣"):
-        assert card_points(Card("V", suit), None, "tout_atout") == 20
-        assert card_points(Card("9", suit), None, "tout_atout") == 14
-
-
-def test_card_points_unknown_declaration_raises():
-    with pytest.raises(ValueError):
-        card_points(Card("A", "♠"), "♠", "sans_atout")
+    assert card_points(Card("A", "♥"), "♠") == 11
+    assert card_points(Card("V", "♥"), "♠") == 2  # jack is non-trump here
 
 
 # --- Bidding legality (A5/A6) --------------------------------------------------
@@ -135,13 +121,6 @@ def test_legal_cards_under_trump_exception_when_partner_holds_highest_trump():
     assert result == hand  # free choice among trumps, no overtrump required
 
 
-def test_legal_cards_tout_atout_no_cutting_concept():
-    hand = [Card("A", "♥"), Card("A", "♦")]  # void of led suit
-    trick = [(Seat.N, Card("8", "♠"))]
-    result = legal_cards_to_play(hand, trick, None, "♠")
-    assert result == hand  # free discard, no suit designated as trump
-
-
 # --- trick_winner --------------------------------------------------------------
 
 
@@ -184,14 +163,6 @@ def test_score_round_contract_failed_defenders_get_full_pool():
     assert result["NS"]["contract_result"] == "failed"
     assert result["NS"]["total"] == 0
     assert result["EW"]["total"] == NORMAL_POOL
-
-
-def test_score_round_tout_atout_pool():
-    captured = {"NS": 50, "EW": 208}
-    bid = {"team": "NS", "trump": "tout_atout", "points": 100}
-    result = score_round(captured, bid, coinche_level=1, capot_result=None, belote_holder=None)
-    assert result["NS"]["contract_result"] == "failed"
-    assert result["EW"]["total"] == TOUT_ATOUT_POOL
 
 
 def test_score_round_capot_achieved():

@@ -12,8 +12,10 @@ name or chat message.
 
 from __future__ import annotations
 
+import io
+
 from rich.align import Align
-from rich.console import Group
+from rich.console import Console, Group
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
@@ -121,16 +123,18 @@ def build_hand(cards: list[str], legal_cards: list[str] | None = None) -> Panel:
     row.add_row(*[card_text(c) for c in cards])
 
     if legal_cards is not None:
-        remaining = list(legal_cards)
-        token = 1
-        number_cells: list[Text] = []
-        for card in cards:
-            if remaining and card == remaining[0]:
-                number_cells.append(Text(str(token), style="bold yellow", justify="center"))
-                remaining.pop(0)
-                token += 1
-            else:
-                number_cells.append(Text(""))
+        # Tokens are assigned by each card's position within `legal_cards`
+        # (matching `render_play_menu`'s numbering), then looked up by card
+        # identity rather than by matching position in `cards` — `cards` is
+        # typically sorted for display and does not share `legal_cards`'
+        # (server-side, unsorted-hand) ordering.
+        token_by_card = {card: i for i, card in enumerate(legal_cards, start=1)}
+        number_cells: list[Text] = [
+            Text(str(token_by_card[card]), style="bold yellow", justify="center")
+            if card in token_by_card
+            else Text("")
+            for card in cards
+        ]
         row.add_row(*number_cells)
 
     return Panel(row, title="Ta main", border_style="green", padding=(0, 1))
@@ -158,11 +162,53 @@ def waiting_for_text(
     return text
 
 
+def contract_text(trump: str | None, points: str | int | None, bidder_name: str | None) -> Text:
+    """'Annonce en cours' line (e.g. "Annonce : 90 Cœur (Paul)"). `bidder_name`
+    is untrusted and always appended via Text.append(), never markup-formatted.
+    Returns empty text while no contract has been settled yet."""
+    if not trump or points is None:
+        return Text("")
+    trump_label = trump
+    points_label = "Capot" if points == "capot" else str(points)
+    text = Text("Annonce : ", style="grey70")
+    text.append(f"{points_label} {trump_label}", style="bold gold3")
+    if bidder_name:
+        text.append(" (", style="grey70")
+        text.append(bidder_name, style="bold white")
+        text.append(")", style="grey70")
+    return text
+
+
+def last_trick_grid(local_seat: Seat, last_trick: dict[Seat, str]) -> Panel | None:
+    """Mini table-shaped rendering of the most recently completed trick: each
+    card is positioned at its own player's seat, rotated so `local_seat`
+    always renders at the bottom ("south") — mirroring `build_table_layout`'s
+    N/E/S/W cross shape instead of a flat card list, so the trick's shape
+    matches the table and stays intuitive for every player. Returns None
+    before any trick has completed."""
+    if not last_trick:
+        return None
+    grid = Table.grid(padding=0)
+    grid.add_column(justify="center", width=3)
+    grid.add_column(justify="center", width=3)
+    grid.add_column(justify="center", width=3)
+    empty = Text("")
+    cells: dict[str, Text] = {}
+    for seat, card in last_trick.items():
+        cells[_visual_position(seat, local_seat)] = card_text(card)
+    grid.add_row(empty, cells.get("north", empty), empty)
+    grid.add_row(cells.get("west", empty), empty, cells.get("east", empty))
+    grid.add_row(empty, cells.get("south", empty), empty)
+    return Panel(grid, title="Dernier pli", border_style="grey50", padding=(0, 0), expand=False)
+
+
 def build_footer(
     cumulative_scores: dict[str, int],
     local_team: str,
     last_action: str,
     waiting: Text | None = None,
+    contract: Text | None = None,
+    last_trick: Panel | None = None,
 ) -> Table:
     other_team = "EW" if local_team == "NS" else "NS"
     footer = Table.grid(expand=True, padding=(0, 2))
@@ -174,6 +220,10 @@ def build_footer(
         ("   Eux ", f"bold {TEAM_COLORS['eux']}"),
         (f"{cumulative_scores.get(other_team, 0)}", "bold white"),
     )
+    if last_trick is not None:
+        footer.add_row(Text(""), Align.right(last_trick))
+    if contract is not None and contract.plain:
+        footer.add_row(Text(""), contract)
     footer.add_row(Text(last_action, style="italic grey50"), scores)
     if waiting is not None and waiting.plain:
         footer.add_row(waiting, Text(""))
@@ -193,19 +243,51 @@ def build_table_view(
     center: Panel | None = None,
     connection_status: dict[Seat, bool] | None = None,
     legal_cards: list[str] | None = None,
+    trump: str | None = None,
+    contract_points: str | int | None = None,
+    contract_bidder_name: str | None = None,
+    last_trick: dict[Seat, str] | None = None,
 ) -> Group:
     """Compose the whole table view into one root renderable for rich.live.Live."""
     table_layout = build_table_layout(
         local_seat, players, team_of, current_trick, whose_turn, center=center, connection_status=connection_status
     )
     waiting = waiting_for_text(whose_turn, players, team_of, local_seat)
+    contract = contract_text(trump, contract_points, contract_bidder_name)
+    last_trick_panel = last_trick_grid(local_seat, last_trick or {})
     return Group(
         Align.center(table_layout),
         Text(""),
         Align.center(build_hand(hand, legal_cards)),
         Text(""),
-        build_footer(cumulative_scores, local_team, last_action, waiting),
+        build_footer(cumulative_scores, local_team, last_action, waiting, contract, last_trick_panel),
     )
+
+
+_BID_CARD_WIDTH = 18
+
+
+def _bid_choice_card(token: str, label: str) -> Panel:
+    """One small rectangular "card" for a stage-1 bid choice: just the number and
+    the action, no free-typing needed to pick it."""
+    content = Text.assemble((f"{token}) ", "bold yellow"), (label, "bold white"))
+    return Panel(Align.center(content), width=_BID_CARD_WIDTH, padding=(0, 1), border_style="grey50")
+
+
+def _cards_grid(entries: list[tuple[str, str]], cards_per_row: int) -> Table:
+    """Lay `entries` out as a grid of `_bid_choice_card`s, `cards_per_row` per line."""
+    grid = Table.grid(padding=(0, 1))
+    for _ in range(cards_per_row):
+        grid.add_column()
+    row: list[Panel] = []
+    for tok, label in entries:
+        row.append(_bid_choice_card(tok, label))
+        if len(row) == cards_per_row:
+            grid.add_row(*row)
+            row = []
+    if row:
+        grid.add_row(*row)
+    return grid
 
 
 def render_bid_menu(
@@ -213,31 +295,31 @@ def render_bid_menu(
     current_highest_bid: dict | None,
     can_coinche: bool = False,
     can_surcoinche: bool = False,
+    cards_per_row: int = 3,
 ) -> tuple[str, dict[str, dict]]:
-    """Stage-1 numbered bid menu: Passer / Coinche / Surcoinche / Annoncer <trump>.
+    """Stage-1 bid menu: Passer / Annoncer <trump> / Coinche / Surcoinche, laid out
+    as a grid of small numbered cards (`cards_per_row` per line) instead of a
+    plain vertical list.
 
-    One line per distinct trump present in `legal_actions` (no free-typing here
+    Token numbers are stable regardless of which optional actions are
+    available: 1 is always "Passer" and the four suits always occupy 2-5 (in
+    fixed suit order), since they're always legal bid choices. Coinche/
+    Surcoinche are only sometimes on offer, so they're numbered last instead
+    of being inserted before the suits (which would otherwise shift the
+    suits' numbers around depending on the auction state).
+
+    One card per distinct trump present in `legal_actions` (no free-typing here
     either). The point value itself is a separate stage 2 the player types by
     hand — see `render_bid_value_prompt` — instead of enumerating every single
-    point level as its own menu entry.
+    point level as its own card.
     """
-    lines: list[str] = []
+    entries: list[tuple[str, str]] = []
     tokens: dict[str, dict] = {}
     token = 1
 
-    lines.append(f"{token}) Passer")
+    entries.append((str(token), "Passer"))
     tokens[str(token)] = {"action": "pass"}
     token += 1
-
-    if can_coinche:
-        lines.append(f"{token}) Coinche")
-        tokens[str(token)] = {"action": "coinche"}
-        token += 1
-
-    if can_surcoinche:
-        lines.append(f"{token}) Surcoinche")
-        tokens[str(token)] = {"action": "surcoinche"}
-        token += 1
 
     seen_trumps: list[str] = []
     for bid in legal_actions:
@@ -245,19 +327,34 @@ def render_bid_menu(
             seen_trumps.append(bid["trump"])
 
     for trump in seen_trumps:
-        trump_label = "Tout Atout" if trump == "tout_atout" else trump
-        lines.append(f"{token}) Annoncer {trump_label}")
+        entries.append((str(token), trump))
         tokens[str(token)] = {"action": "select_trump", "trump": trump}
+        token += 1
+
+    if can_coinche:
+        entries.append((str(token), "Coinche"))
+        tokens[str(token)] = {"action": "coinche"}
+        token += 1
+
+    if can_surcoinche:
+        entries.append((str(token), "Surcoinche"))
+        tokens[str(token)] = {"action": "surcoinche"}
         token += 1
 
     if current_highest_bid is None:
         header = "Enchère actuelle : aucune"
     else:
-        cur_trump = "Tout Atout" if current_highest_bid["trump"] == "tout_atout" else current_highest_bid["trump"]
+        cur_trump = current_highest_bid["trump"]
         cur_points = "Capot" if current_highest_bid["points"] == "capot" else current_highest_bid["points"]
         header = f"Enchère actuelle : {cur_points} {cur_trump}"
 
-    menu_text = header + "\n" + "\n".join(lines)
+    grid = _cards_grid(entries, cards_per_row)
+    render_width = cards_per_row * (_BID_CARD_WIDTH + 4)
+    buffer = io.StringIO()
+    console = Console(file=buffer, width=render_width, force_terminal=True)
+    console.print(Text(header, style="grey70"))
+    console.print(grid)
+    menu_text = buffer.getvalue().rstrip("\n")
     return menu_text, tokens
 
 
@@ -267,7 +364,7 @@ def render_bid_value_prompt(trump: str, legal_actions: list[dict]) -> tuple[str,
     Returns the prompt text plus the sorted list of legal values (ints, and
     "capot" if it's still an option) so the caller can validate the typed input.
     """
-    trump_label = "Tout Atout" if trump == "tout_atout" else trump
+    trump_label = trump
     points_for_trump = [bid["points"] for bid in legal_actions if bid["trump"] == trump]
     numeric_points = sorted(p for p in points_for_trump if p != "capot")
     has_capot = "capot" in points_for_trump

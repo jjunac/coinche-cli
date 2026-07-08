@@ -1,10 +1,11 @@
 """Coinche TCP client: connection, live-redraw table view, keyboard-menu prompts.
 
 Run with: python -m coinche.client [--host HOST] [--port PORT] [--table KEY] [--name NAME]
-                                    [--partner PARTNER_NAME]
-Any omitted value falls back to an interactive input() prompt. `--partner` is
-optional: it names another player to try to be seated with on the same team
-(best-effort; the server falls back to normal seating if that isn't possible).
+                                    [--team TEAM_NAME]
+Any omitted value falls back to an interactive input() prompt. `--team` is
+optional: it's a free-text label (e.g. "A"/"B") shared with a teammate to try
+to be seated on the same team (best-effort; the server falls back to normal
+seating if that isn't possible).
 """
 
 from __future__ import annotations
@@ -20,10 +21,17 @@ from rich.text import Text
 from coinche import protocol, ui
 from coinche.cards import Seat
 from coinche.game import TEAM_OF
+from coinche.rules import NONTRUMP_ORDER, TRUMP_ORDER
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 BACKOFF_DELAYS = (1, 2, 4, 8, 16)
+
+# Suit order used only when displaying a hand, chosen so that black/red
+# suits alternate left to right (pique, cœur, trèfle, carreau) for
+# readability. This is distinct from `cards.SUITS`, which stays in its
+# original order for bid/trump enumeration elsewhere.
+HAND_SUIT_ORDER: tuple[str, ...] = ("♠", "♥", "♣", "♦")
 
 
 @dataclass
@@ -35,8 +43,21 @@ class ClientState:
     hand: list[str] = field(default_factory=list)
     legal_cards: list[str] = field(default_factory=list)
     current_trick: dict[Seat, str] = field(default_factory=dict)
+    last_trick: dict[Seat, str] = field(default_factory=dict)
     whose_turn: Seat | None = None
     trump: str | None = None
+    contract_points: str | int | None = None
+    contract_bidder: Seat | None = None
+    # Highest bid still standing *while bidding is ongoing* (distinct from
+    # `trump`/`contract_points`/`contract_bidder` above, which only get set
+    # once bidding has settled into a final contract at BIDDING_RESULT).
+    current_bid_trump: str | None = None
+    current_bid_points: str | int | None = None
+    current_bid_seat: Seat | None = None
+    # Each seat's most recent bidding action (e.g. "90 ♥", "Passe", "Coinche"),
+    # shown at that seat's position on the table in place of a played card —
+    # there's nothing to play yet during bidding. Cleared once bidding ends.
+    bid_marks: dict[Seat, str] = field(default_factory=dict)
     cumulative_scores: dict[str, int] = field(default_factory=lambda: {"NS": 0, "EW": 0})
     connection_status: dict[Seat, bool] = field(default_factory=dict)
     status_message: str = ""
@@ -61,7 +82,27 @@ def _trick_from_wire(entries: list[dict]) -> dict[Seat, str]:
 
 
 def _trump_label(trump: str) -> str:
-    return "Tout Atout" if trump == "tout_atout" else trump
+    return trump
+
+
+def _sort_hand(hand: list[str], trump: str | None) -> list[str]:
+    """Sort a hand strongest-to-weakest, left to right (grouped by suit, in
+    `HAND_SUIT_ORDER`, which alternates black/red suits for readability).
+    Before a trump is known (`trump=None`), every suit is ordered by its
+    non-trump strength. Once a trump is declared, that suit's cards use the
+    trump strength order instead, so the ranking of e.g. the Jack/9 changes
+    accordingly."""
+
+    def rank_strength(rank: str, suit: str) -> int:
+        if suit == trump:
+            return TRUMP_ORDER.index(rank)
+        return NONTRUMP_ORDER.index(rank)
+
+    def sort_key(card: str) -> tuple[int, int]:
+        rank, suit = card[:-1], card[-1]
+        return (HAND_SUIT_ORDER.index(suit), -rank_strength(rank, suit))
+
+    return sorted(hand, key=sort_key)
 
 
 def _bid_action_label(payload: dict) -> str:
@@ -75,6 +116,31 @@ def _bid_action_label(payload: dict) -> str:
         return "a surcoinché"
     points = "Capot" if payload.get("points") == "capot" else payload.get("points")
     return f"a annoncé {points} {_trump_label(payload['trump'])}"
+
+
+def _bid_mark_label(entry: dict) -> str:
+    """Compact label for a single bid action, shown at the acting seat's
+    position on the table (e.g. "90 ♥", "Passe", "Coinche", "Surcoinche")."""
+    action = entry["action"]
+    if action == "pass":
+        return "Passe"
+    if action == "coinche":
+        return "Coinche"
+    if action == "surcoinche":
+        return "Surcoinche"
+    points = "Capot" if entry.get("points") == "capot" else entry.get("points")
+    return f"{points} {_trump_label(entry['trump'])}"
+
+
+def _apply_current_highest_bid(state: ClientState, current_highest_bid: dict | None) -> None:
+    if current_highest_bid is None:
+        state.current_bid_trump = None
+        state.current_bid_points = None
+        state.current_bid_seat = None
+    else:
+        state.current_bid_trump = current_highest_bid["trump"]
+        state.current_bid_points = current_highest_bid["points"]
+        state.current_bid_seat = Seat(current_highest_bid["seat"])
 
 
 def _apply_message(state: ClientState, msg_type: str, payload: dict, action_event: asyncio.Event) -> None:
@@ -92,15 +158,23 @@ def _apply_message(state: ClientState, msg_type: str, payload: dict, action_even
         state.status_message = f"En attente de joueurs ({payload['seats_filled']}/4)..."
 
     elif msg_type == protocol.DEAL:
-        state.hand = list(payload["hand"])
+        state.hand = _sort_hand(payload["hand"], None)
         state.legal_cards = []
         state.current_trick = {}
+        state.last_trick = {}
         state.trump = None
+        state.contract_points = None
+        state.contract_bidder = None
+        state.current_bid_trump = None
+        state.current_bid_points = None
+        state.current_bid_seat = None
+        state.bid_marks = {}
         state.whose_turn = Seat(payload["first_bidder_seat"])
         state.last_action = f"Nouvelle donne #{payload['round_number']} (donneur {payload['dealer_seat']})"
 
     elif msg_type == protocol.BID_REQUEST:
         state.pending_bid_request = payload
+        _apply_current_highest_bid(state, payload["current_highest_bid"])
         state.whose_turn = state.seat
         action_event.set()
 
@@ -108,14 +182,23 @@ def _apply_message(state: ClientState, msg_type: str, payload: dict, action_even
         seat = Seat(payload["seat"])
         who = state.players.get(seat, seat.value)
         state.last_action = f"{who} {_bid_action_label(payload)}"
+        state.bid_marks[seat] = _bid_mark_label(payload)
+        if payload["action"] == "bid":
+            state.current_bid_trump = payload["trump"]
+            state.current_bid_points = payload["points"]
+            state.current_bid_seat = seat
         state.whose_turn = Seat(payload["next_to_act"])
 
     elif msg_type == protocol.BIDDING_RESULT:
+        state.bid_marks = {}
         if payload["outcome"] == "redeal":
             state.last_action = "Tout le monde a passé — nouvelle donne"
             state.whose_turn = None
         else:
             state.trump = payload["trump"]
+            state.hand = _sort_hand(state.hand, state.trump)
+            state.contract_points = payload["points"]
+            state.contract_bidder = Seat(payload["seat"])
             who = state.players.get(Seat(payload["seat"]), payload["seat"])
             points = "Capot" if payload["points"] == "capot" else payload["points"]
             state.last_action = f"Contrat retenu : {points} {_trump_label(payload['trump'])} par {who}"
@@ -123,7 +206,10 @@ def _apply_message(state: ClientState, msg_type: str, payload: dict, action_even
 
     elif msg_type == protocol.PLAY_REQUEST:
         state.pending_play_request = payload
-        state.legal_cards = list(payload["legal_cards"])
+        # Sort legal cards the same way the hand is displayed, so the
+        # numbered choices shown under the hand read 1, 2, 3... left to
+        # right instead of following the server's (unsorted) hand order.
+        state.legal_cards = _sort_hand(payload["legal_cards"], payload["trump"])
         state.trump = payload["trump"]
         state.current_trick = _trick_from_wire(payload["current_trick"])
         state.whose_turn = state.seat
@@ -141,6 +227,7 @@ def _apply_message(state: ClientState, msg_type: str, payload: dict, action_even
 
     elif msg_type == protocol.TRICK_RESULT:
         state.current_trick = {}
+        state.last_trick = _trick_from_wire(payload["trick"])
         winner = Seat(payload["winner_seat"])
         who = state.players.get(winner, winner.value)
         state.last_action = f"Pli remporté par {who} (+{payload['points_won']} pts)"
@@ -160,15 +247,22 @@ def _apply_message(state: ClientState, msg_type: str, payload: dict, action_even
         state.joined_once = True
         state.table_key = payload["table_key"]
         state.seat = Seat(payload["seat"])
-        state.hand = list(payload["hand"])
+        state.trump = payload["trump"]
+        state.hand = _sort_hand(payload["hand"], state.trump)
         state.legal_cards = []
         state.current_trick = _trick_from_wire(payload["current_trick"])
-        state.trump = payload["trump"]
         state.cumulative_scores = payload["cumulative_scores"]
         if state.seat not in state.players:
             state.players[state.seat] = state.players.get(state.seat, "Moi")
         state.team_of = {s: TEAM_OF[s] for s in Seat}
         state.whose_turn = Seat(payload["whose_turn"]) if payload.get("whose_turn") else None
+        state.bid_marks = {}
+        if payload.get("phase") == "bidding":
+            _apply_current_highest_bid(state, payload.get("current_highest_bid"))
+            for entry in payload.get("bid_history", []):
+                state.bid_marks[Seat(entry["seat"])] = _bid_mark_label(entry)
+        else:
+            _apply_current_highest_bid(state, None)
         state.status_message = "Reconnecté — synchronisation effectuée"
         state.last_action = "Reconnecté — synchronisation effectuée"
 
@@ -188,13 +282,14 @@ def _apply_message(state: ClientState, msg_type: str, payload: dict, action_even
 
 
 async def run_session(
-    host: str, port: int, table_key: str, player_name: str, preferred_partner: str | None = None
+    host: str, port: int, table_key: str, player_name: str, team_name: str | None = None
 ) -> str:
     """Run one connection attempt end-to-end.
 
-    `preferred_partner`, if given, names another player to try to be seated with
-    on the same team (best-effort; the server falls back to normal seating if
-    that player hasn't joined yet or their team is already full).
+    `team_name`, if given, is a free-text label (e.g. "A"/"B") shared with a
+    teammate to try to be seated on the same team (best-effort; the server
+    falls back to normal seating if no other player joined with the same
+    label yet, or their team is already full).
 
     Returns "not_joined" if the session never completed a join/resync,
     "game_over" if the game concluded normally, or "disconnected" if the
@@ -212,7 +307,7 @@ async def run_session(
         writer.write(
             protocol.encode(
                 protocol.JOIN,
-                {"table_key": table_key, "player_name": player_name, "preferred_partner": preferred_partner},
+                {"table_key": table_key, "player_name": player_name, "team_name": team_name},
             )
         )
         await writer.drain()
@@ -228,11 +323,29 @@ async def run_session(
             live.update(Text(state.status_message))
         else:
             local_team = state.team_of.get(state.seat, "NS")
+            # While bidding is still open (no settled contract yet), show the
+            # current highest bid and its author instead; both share the same
+            # "Annonce : ..." footer line via `contract_bidder_name` below.
+            if state.contract_bidder is not None:
+                display_trump = state.trump
+                display_points = state.contract_points
+                display_bidder = state.contract_bidder
+            else:
+                display_trump = state.current_bid_trump
+                display_points = state.current_bid_points
+                display_bidder = state.current_bid_seat
+            contract_bidder_name = (
+                state.players.get(display_bidder, display_bidder.value) if display_bidder is not None else None
+            )
+            # During bidding, no cards have been played yet, so `bid_marks`
+            # (each seat's last bid action) is shown at the same table
+            # position a played card would occupy.
+            table_marks = state.bid_marks or state.current_trick
             view = ui.build_table_view(
                 state.seat,
                 state.players,
                 state.team_of,
-                state.current_trick,
+                table_marks,
                 state.whose_turn,
                 state.hand,
                 state.cumulative_scores,
@@ -240,6 +353,10 @@ async def run_session(
                 state.last_action,
                 connection_status=state.connection_status,
                 legal_cards=state.legal_cards or None,
+                trump=display_trump,
+                contract_points=display_points,
+                contract_bidder_name=contract_bidder_name,
+                last_trick=state.last_trick,
             )
             live.update(view)
         live.refresh()
@@ -299,9 +416,10 @@ async def run_session(
                     return
 
             elif state.pending_play_request is not None:
-                req = state.pending_play_request
                 state.pending_play_request = None
-                _, tokens = ui.render_play_menu(req["legal_cards"])
+                # Use state.legal_cards (already sorted to match the hand
+                # display order) so menu numbers line up with build_hand's.
+                _, tokens = ui.render_play_menu(state.legal_cards)
                 choice = await _prompt_key_choice(tokens)
                 state.legal_cards = []
                 redraw()
@@ -384,11 +502,11 @@ def _prompt_missing(args: argparse.Namespace) -> tuple[str, int, str, str, str |
         port = int(raw_port) if raw_port else DEFAULT_PORT
     table_key = args.table or input("Clé de table : ").strip()
     player_name = args.name or input("Votre nom : ").strip()
-    if args.partner is not None:
-        preferred_partner = args.partner.strip() or None
+    if args.team is not None:
+        team_name = args.team.strip() or None
     else:
-        preferred_partner = input("Partenaire souhaité (optionnel) : ").strip() or None
-    return host, port, table_key, player_name, preferred_partner
+        team_name = input("Nom d'équipe (optionnel, ex: A/B) : ").strip() or None
+    return host, port, table_key, player_name, team_name
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -398,16 +516,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--table", help="Table key")
     parser.add_argument("--name", help="Player name")
     parser.add_argument(
-        "--partner", help="Name of another player to try to be seated with on the same team (best-effort)"
+        "--team", help="Team label (e.g. 'A'/'B') shared with a teammate to try to be seated together (best-effort)"
     )
     return parser
 
 
 async def main(argv: list[str] | None = None) -> None:
     args = build_arg_parser().parse_args(argv)
-    host, port, table_key, player_name, preferred_partner = _prompt_missing(args)
+    host, port, table_key, player_name, team_name = _prompt_missing(args)
 
-    result = await run_session(host, port, table_key, player_name, preferred_partner)
+    result = await run_session(host, port, table_key, player_name, team_name)
     if result == "not_joined":
         return
     if result == "game_over":
@@ -417,7 +535,7 @@ async def main(argv: list[str] | None = None) -> None:
     for delay in BACKOFF_DELAYS:
         print(f"Connexion perdue. Nouvelle tentative dans {delay}s...")
         await asyncio.sleep(delay)
-        result = await run_session(host, port, table_key, player_name, preferred_partner)
+        result = await run_session(host, port, table_key, player_name, team_name)
         if result == "game_over":
             print("Partie terminée. Au revoir !")
             return

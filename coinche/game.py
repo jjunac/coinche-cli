@@ -73,8 +73,7 @@ class RoundState:
     dealer: Seat
     dealt_hands: dict[Seat, list[Card]]
     hands: dict[Seat, list[Card]]
-    trump: str | None = None  # suit glyph, or None for tout_atout
-    declaration: str | None = None  # "normal" | "tout_atout"
+    trump: str | None = None  # suit glyph, set once bidding settles
     leader: Seat | None = None
     current_trick: list[tuple[Seat, Card]] = field(default_factory=list)
     trick_history: list[dict] = field(default_factory=list)
@@ -244,14 +243,8 @@ class Game:
         assert contract is not None
 
         trump_glyph = contract["trump"]
-        declaration = "tout_atout" if trump_glyph == "tout_atout" else "normal"
-        trump_suit = None if declaration == "tout_atout" else trump_glyph
-
-        self.round_state.trump = trump_suit
-        self.round_state.declaration = declaration
-
-        if declaration == "normal":
-            self.round_state.belote_holder = self._detect_belote(trump_suit)
+        self.round_state.trump = trump_glyph
+        self.round_state.belote_holder = self._detect_belote(trump_glyph)
 
         first_leader = self.dealer.next()
         self.round_state.leader = first_leader
@@ -344,7 +337,7 @@ class Game:
         led_suit = rs.current_trick[0][1].suit
         winner_seat = rules.trick_winner(rs.current_trick, rs.trump, led_suit)
         points_won = sum(
-            rules.card_points(c, rs.trump, rs.declaration) for _, c in rs.current_trick
+            rules.card_points(c, rs.trump) for _, c in rs.current_trick
         )
         rs.tricks_played += 1
         is_last_trick = rs.tricks_played == 8
