@@ -7,11 +7,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import logging
 import re
 
 from coinche import __version__, protocol, rules
 from coinche.cards import Card, Seat
-from coinche.game import IllegalBidError, IllegalCardError, NotYourTurnError
+from coinche.game import TEAM_OF, IllegalBidError, IllegalCardError, NotYourTurnError
 from coinche.table import (
     GameInProgressError,
     NameTakenError,
@@ -22,9 +23,22 @@ from coinche.table import (
 
 TABLE_KEY_PATTERN = re.compile(r"^[A-Za-z0-9]{4,12}$")
 
+# Dedicated "game log" logger (per user request): records who bid/played what
+# and which team took each trick/round/game, so results can be double-checked
+# after the fact. Configured (handler/level) in `main()`; kept separate from
+# ad-hoc `print()` startup messages.
+logger = logging.getLogger("coinche.server")
+
 
 def _seat_to_str(seat: Seat) -> str:
     return seat.value
+
+
+def _player_label(table: Table, seat: Seat) -> str:
+    """Human-readable "Name (seat/TEAM)" label for game-log lines."""
+    session = table.seats.get(seat)
+    name = session.name if session is not None else "?"
+    return f"{name} ({_seat_to_str(seat)}/{TEAM_OF[seat]})"
 
 
 def _card_to_wire(card: Card) -> str:
@@ -135,6 +149,24 @@ async def _handle_bid_result(table: Table, seat: Seat, result: dict) -> None:
     outcome = result["outcome"]
 
     if outcome == "continue":
+        action = result["action"]
+        if action == "bid":
+            logger.info(
+                "[%s] R%d ANNONCE %s -> %s %s",
+                table.table_key,
+                game.round_number,
+                _player_label(table, seat),
+                result.get("points"),
+                result.get("trump"),
+            )
+        else:
+            logger.info(
+                "[%s] R%d %s -> %s",
+                table.table_key,
+                game.round_number,
+                _player_label(table, seat),
+                action.upper(),
+            )
         await table.broadcast(
             protocol.BID_UPDATE,
             {
@@ -148,6 +180,12 @@ async def _handle_bid_result(table: Table, seat: Seat, result: dict) -> None:
         await _send_bid_request(table, result["next_to_act"])
 
     elif outcome == "redeal":
+        logger.info(
+            "[%s] R%d REDONNE (tout le monde a passé), nouveau donneur %s",
+            table.table_key,
+            game.round_number,
+            _player_label(table, result["dealer_seat"]),
+        )
         await table.broadcast(
             protocol.BIDDING_RESULT,
             {"outcome": "redeal", "dealer_seat": _seat_to_str(result["dealer_seat"])},
@@ -156,6 +194,16 @@ async def _handle_bid_result(table: Table, seat: Seat, result: dict) -> None:
         await _send_bid_request(table, game.next_to_act)
 
     elif outcome == "contract":
+        logger.info(
+            "[%s] R%d CONTRAT %s %s par %s (equipe %s) coinche_level=%d",
+            table.table_key,
+            game.round_number,
+            result["points"],
+            result["trump"],
+            _player_label(table, result["seat"]),
+            result["attacking_team"],
+            result["coinche_level"],
+        )
         await table.broadcast(
             protocol.BIDDING_RESULT,
             {
@@ -175,6 +223,16 @@ async def _handle_play_result(table: Table, result: dict) -> None:
     game = table.game
     assert game is not None
 
+    belote = result.get("belote_announcement")
+    logger.info(
+        "[%s] R%d JOUE %s -> %s%s",
+        table.table_key,
+        game.round_number,
+        _player_label(table, result["seat"]),
+        _card_to_wire(result["card"]),
+        f" ({belote} !)" if belote else "",
+    )
+
     next_actor = result.get("next_to_act")
     await table.broadcast(
         protocol.CARD_PLAYED,
@@ -183,7 +241,7 @@ async def _handle_play_result(table: Table, result: dict) -> None:
             "card": _card_to_wire(result["card"]),
             "current_trick": _trick_to_wire(result["current_trick"]),
             "next_to_act": _seat_to_str(next_actor) if next_actor is not None else None,
-            "belote_announcement": result.get("belote_announcement"),
+            "belote_announcement": belote,
         },
     )
 
@@ -191,6 +249,15 @@ async def _handle_play_result(table: Table, result: dict) -> None:
         await _send_play_request(table, result["next_to_act"])
         return
 
+    logger.info(
+        "[%s] R%d PLI #%d gagne par %s (%d pts, %d restants)",
+        table.table_key,
+        game.round_number,
+        result["tricks_played"],
+        _player_label(table, result["winner_seat"]),
+        result["points_won"],
+        result["tricks_remaining"],
+    )
     await table.broadcast(
         protocol.TRICK_RESULT,
         {
@@ -213,6 +280,15 @@ async def _handle_play_result(table: Table, result: dict) -> None:
         return
 
     next_dealer_seat = result["next_dealer_seat"]
+    logger.info(
+        "[%s] R%d FIN DE MANCHE score_manche NS=%d EW=%d cumul NS=%d EW=%d",
+        table.table_key,
+        game.round_number,
+        result["round_score"]["NS"],
+        result["round_score"]["EW"],
+        result["cumulative_scores"]["NS"],
+        result["cumulative_scores"]["EW"],
+    )
     await table.broadcast(
         protocol.ROUND_SCORE,
         {
@@ -224,6 +300,13 @@ async def _handle_play_result(table: Table, result: dict) -> None:
     )
 
     if result["game_over"]:
+        logger.info(
+            "[%s] FIN DE PARTIE equipe gagnante=%s scores finaux NS=%d EW=%d",
+            table.table_key,
+            result["winning_team"],
+            result["cumulative_scores"]["NS"],
+            result["cumulative_scores"]["EW"],
+        )
         await table.broadcast(
             protocol.GAME_OVER,
             {"final_scores": result["cumulative_scores"], "winning_team": result["winning_team"]},
@@ -277,6 +360,7 @@ async def _dispatch(table: Table, seat: Seat, msg_type: str, payload: dict) -> N
         # is silently ignored rather than restarting an in-progress game.
         if game is None or not game.game_over:
             return
+        logger.info("[%s] NOUVELLE PARTIE demandee par %s", table.table_key, _player_label(table, seat))
         table.restart_game()
         await table.broadcast(protocol.NEW_GAME, {"target_score": table.target_score})
         await _broadcast_deal(table)
@@ -324,6 +408,7 @@ async def _resolve_join(
 
         if reconnect_seat is not None:
             seat = reconnect_seat
+            logger.info("[%s] RECONNEXION %s (%s)", table_key, player_name, _seat_to_str(seat))
             snapshot = table.reconnect(seat, writer)
             await table.send_to(seat, protocol.RESYNC, _snapshot_to_wire(snapshot, table_key))
             await table.broadcast(
@@ -353,6 +438,13 @@ async def _resolve_join(
             await _send_error(writer, protocol.TABLE_FULL, "Table is full")
             return None
 
+        logger.info(
+            "[%s] CONNEXION %s (%s)%s",
+            table_key,
+            player_name,
+            _seat_to_str(seat),
+            f" equipe={team_name}" if team_name else "",
+        )
         players = _players_summary(table)
         await table.send_to(
             seat,
@@ -424,6 +516,7 @@ async def handle_connection(
                     )
                 else:
                     name = table.mark_disconnected(seat)
+                    logger.info("[%s] DECONNEXION %s (%s)", table.table_key, name, _seat_to_str(seat))
                     await table.broadcast(
                         protocol.CONNECTION_STATUS,
                         {"seat": _seat_to_str(seat), "name": name, "status": "disconnected"},
@@ -450,11 +543,32 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=2.5,
         help="Seconds to pause after each completed trick so players can see the last card played (default: 2.5)",
     )
+    parser.add_argument(
+        "--log-level",
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+        help="Game-log verbosity: who bid/played what, trick/round/game winners (default: INFO)",
+    )
+    parser.add_argument(
+        "--log-file",
+        default=None,
+        help="Optional file path to also write the game log to (in addition to stdout)",
+    )
     return parser
 
 
 async def main(argv: list[str] | None = None) -> None:
     args = build_arg_parser().parse_args(argv)
+
+    handlers: list[logging.Handler] = [logging.StreamHandler()]
+    if args.log_file:
+        handlers.append(logging.FileHandler(args.log_file, encoding="utf-8"))
+    logging.basicConfig(
+        level=getattr(logging, args.log_level),
+        format="%(asctime)s %(levelname)s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        handlers=handlers,
+    )
 
     async def _handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         await handle_connection(reader, writer, args.target_score, trick_pause_seconds=args.trick_pause)
