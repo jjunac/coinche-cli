@@ -44,6 +44,7 @@ class Table:
         table_key: str,
         target_score: int = rules.DEFAULT_TARGET_SCORE,
         trick_pause_seconds: float = 2.5,
+        round_pause_seconds: float = 4.0,
     ) -> None:
         self.table_key = table_key
         self.target_score = target_score
@@ -51,6 +52,11 @@ class Table:
         # moving play on (next play_request, or dealing the next round), so
         # every player has time to see the last card played (per user request).
         self.trick_pause_seconds = trick_pause_seconds
+        # How long the server waits after broadcasting a round's final score
+        # (ROUND_SCORE) before dealing the next round, so every player has
+        # time to read the end-of-round recap (contract result, cumulative
+        # score) shown by the client instead of it flashing by unseen.
+        self.round_pause_seconds = round_pause_seconds
         self.lock = asyncio.Lock()
         self.seats: dict[Seat, ClientSession | None] = {seat: None for seat in SEAT_ORDER}
         self.game: Game | None = None
@@ -174,8 +180,14 @@ def get_or_create_table(
     table_key: str,
     target_score: int = rules.DEFAULT_TARGET_SCORE,
     trick_pause_seconds: float = 2.5,
+    round_pause_seconds: float = 4.0,
 ) -> Table:
     """Lazily create (on first join) or return the existing table for `table_key`."""
     if table_key not in TABLES:
-        TABLES[table_key] = Table(table_key, target_score=target_score, trick_pause_seconds=trick_pause_seconds)
+        TABLES[table_key] = Table(
+            table_key,
+            target_score=target_score,
+            trick_pause_seconds=trick_pause_seconds,
+            round_pause_seconds=round_pause_seconds,
+        )
     return TABLES[table_key]

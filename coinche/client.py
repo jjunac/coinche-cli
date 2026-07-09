@@ -107,6 +107,16 @@ class ClientState:
     final_scores: dict[str, int] = field(default_factory=lambda: {"NS": 0, "EW": 0})
     winning_team: str | None = None
     last_round_score: dict[str, dict] | None = None
+    # Whether the end-of-round recap (score of the manche just finished, plus
+    # whether the announced contract was honored) should currently be shown
+    # in place of the normal table view. Set on ROUND_SCORE, cleared once the
+    # next round's DEAL arrives (or the game ends, since GAME_OVER shows its
+    # own final recap instead).
+    round_over_screen: bool = False
+    # Built alongside `last_round_score` (see `_build_last_round_contract`),
+    # while `contract_bidder`/`trump`/`contract_points` still describe the
+    # round that just ended (before the next DEAL resets them).
+    last_round_contract: dict | None = None
     # Set once when the server reports a version different from ours (see
     # `_apply_message`'s JOINED/RESYNC handling); `update_notice_shown` guards
     # against printing the banner more than once per session.
@@ -223,6 +233,28 @@ def _bid_mark_label(entry: dict) -> str:
     return f"{points} {_trump_label(entry['trump'])}"
 
 
+def _build_last_round_contract(state: ClientState) -> dict | None:
+    """Build the {trump, points, bidder_name, attacking_team, result} summary of
+    the round that just ended, from the contract fields BIDDING_RESULT set
+    (still valid at ROUND_SCORE/GAME_OVER time, before the next DEAL resets
+    them) plus `state.last_round_score`'s per-team `contract_result`. Returns
+    None if there's nothing to show yet (e.g. `last_round_score` hasn't been
+    populated)."""
+    if state.contract_bidder is None or state.last_round_score is None:
+        return None
+    attacking_team = state.team_of.get(state.contract_bidder, "NS")
+    round_score_for_attacker = state.last_round_score.get(attacking_team)
+    if round_score_for_attacker is None:
+        return None
+    return {
+        "trump": state.trump,
+        "points": state.contract_points,
+        "bidder_name": state.players.get(state.contract_bidder, state.contract_bidder.value),
+        "attacking_team": attacking_team,
+        "result": round_score_for_attacker["contract_result"],
+    }
+
+
 def _apply_current_highest_bid(state: ClientState, current_highest_bid: dict | None) -> None:
     if current_highest_bid is None:
         state.current_bid_trump = None
@@ -267,6 +299,10 @@ def _apply_message(state: ClientState, msg_type: str, payload: dict, action_even
         state.whose_turn = Seat(payload["first_bidder_seat"])
         state.dealer_seat = Seat(payload["dealer_seat"])
         state.last_action = f"Nouvelle donne #{payload['round_number']} (donneur {payload['dealer_seat']})"
+        # The new deal means the round-over recap (if any was showing) is done
+        # being displayed -- the server only sends DEAL after pausing long
+        # enough for players to read it (see ROUND_SCORE below).
+        state.round_over_screen = False
 
     elif msg_type == protocol.BID_REQUEST:
         state.pending_bid_request = payload
@@ -363,11 +399,18 @@ def _apply_message(state: ClientState, msg_type: str, payload: dict, action_even
     elif msg_type == protocol.ROUND_SCORE:
         state.cumulative_scores = payload["cumulative"]
         state.last_round_score = {"NS": payload["team_NS"], "EW": payload["team_EW"]}
+        state.last_round_contract = _build_last_round_contract(state)
+        # Shown in place of the normal table view until the next DEAL arrives
+        # (the server pauses in between so this has time to be read); skipped
+        # entirely if this round also ended the game (see GAME_OVER below),
+        # whose own recap screen already covers this same information.
+        state.round_over_screen = True
         state.last_action = "Score de la manche"
         state.whose_turn = None
 
     elif msg_type == protocol.GAME_OVER:
         state.game_over = True
+        state.round_over_screen = False
         state.final_scores = payload["final_scores"]
         state.winning_team = payload["winning_team"]
         state.last_action = f"Partie terminée — vainqueur : {payload['winning_team']}"
@@ -376,9 +419,11 @@ def _apply_message(state: ClientState, msg_type: str, payload: dict, action_even
 
     elif msg_type == protocol.NEW_GAME:
         state.game_over = False
+        state.round_over_screen = False
         state.final_scores = {"NS": 0, "EW": 0}
         state.winning_team = None
         state.last_round_score = None
+        state.last_round_contract = None
         state.cumulative_scores = {"NS": 0, "EW": 0}
         state.last_action = "Nouvelle partie !"
 
@@ -393,6 +438,10 @@ def _apply_message(state: ClientState, msg_type: str, payload: dict, action_even
         state.pending_last_trick = None
         state.cumulative_scores = payload["cumulative_scores"]
         state.server_version = payload.get("server_version")
+        # A resync always drops the player back onto the live table (mid-deal
+        # or mid-bid), never into an in-between-rounds pause, so any stale
+        # round-over recap must be cleared here too.
+        state.round_over_screen = False
         if payload.get("players"):
             state.players = _players_from_wire(payload["players"])
             state.team_names = _team_names_from_wire(payload["players"])
@@ -468,6 +517,21 @@ async def run_session(
             live.console.print(ui.render_update_notice(__version__, state.server_version))
         if state.seat is None or not state.players:
             live.update(Text(state.status_message))
+        elif state.round_over_screen and not state.game_over:
+            # End-of-round recap (score of the manche just finished, whether
+            # the announced contract was honored, cumulative score so far):
+            # shown in place of the table until the next DEAL arrives, which
+            # the server delays just long enough for this to be readable.
+            local_team = state.team_of.get(state.seat, "NS")
+            live.update(
+                ui.render_round_score(
+                    state.last_round_score,
+                    state.cumulative_scores,
+                    local_team,
+                    team_names=state.team_names,
+                    contract=state.last_round_contract,
+                )
+            )
         else:
             local_team = state.team_of.get(state.seat, "NS")
             # While bidding is still open (no settled contract yet), show the
@@ -694,18 +758,7 @@ async def _prompt_game_over_screen(live: Live, state: ClientState) -> str:
     honored, winner) and wait for the player to pick "Nouvelle partie" or
     "Quitter". Returns "rematch" or "quit" (also "quit" if stdin closes)."""
     local_team = state.team_of.get(state.seat, "NS") if state.seat is not None else "NS"
-    contract: dict | None = None
-    if state.contract_bidder is not None and state.last_round_score is not None:
-        attacking_team = state.team_of.get(state.contract_bidder, "NS")
-        round_score_for_attacker = state.last_round_score.get(attacking_team)
-        if round_score_for_attacker is not None:
-            contract = {
-                "trump": state.trump,
-                "points": state.contract_points,
-                "bidder_name": state.players.get(state.contract_bidder, state.contract_bidder.value),
-                "attacking_team": attacking_team,
-                "result": round_score_for_attacker["contract_result"],
-            }
+    contract = _build_last_round_contract(state)
     screen = ui.render_game_over(
         state.final_scores, state.winning_team or "", local_team, contract, state.team_names
     )

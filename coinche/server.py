@@ -328,6 +328,11 @@ async def _handle_play_result(table: Table, result: dict) -> None:
             {"final_scores": result["cumulative_scores"], "winning_team": result["winning_team"]},
         )
     else:
+        # Pause here (per user request) so every player has time to read the
+        # just-finished round's recap (contract result + cumulative score,
+        # shown by the client as an end-of-round screen) before the table
+        # moves on to the next deal -- otherwise it flashes by unseen.
+        await asyncio.sleep(table.round_pause_seconds)
         await _broadcast_deal(table)
         await _send_bid_request(table, game.next_to_act)
 
@@ -385,7 +390,11 @@ async def _dispatch(table: Table, seat: Seat, msg_type: str, payload: dict) -> N
 
 
 async def _resolve_join(
-    reader: asyncio.StreamReader, writer: asyncio.StreamWriter, target_score: int, trick_pause_seconds: float
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    target_score: int,
+    trick_pause_seconds: float,
+    round_pause_seconds: float,
 ) -> tuple[Table, Seat] | None:
     try:
         line = await reader.readline()
@@ -417,7 +426,12 @@ async def _resolve_join(
         await _send_error(writer, protocol.MALFORMED_MESSAGE, "player_name must not be empty")
         return None
 
-    table = get_or_create_table(table_key, target_score=target_score, trick_pause_seconds=trick_pause_seconds)
+    table = get_or_create_table(
+        table_key,
+        target_score=target_score,
+        trick_pause_seconds=trick_pause_seconds,
+        round_pause_seconds=round_pause_seconds,
+    )
 
     async with table.lock:
         reconnect_seat = table.find_disconnected_seat(player_name) if table.game is not None else None
@@ -490,11 +504,12 @@ async def handle_connection(
     writer: asyncio.StreamWriter,
     target_score: int,
     trick_pause_seconds: float = 2.5,
+    round_pause_seconds: float = 4.0,
 ) -> None:
     table: Table | None = None
     seat: Seat | None = None
     try:
-        joined = await _resolve_join(reader, writer, target_score, trick_pause_seconds)
+        joined = await _resolve_join(reader, writer, target_score, trick_pause_seconds, round_pause_seconds)
         if joined is None:
             return
         table, seat = joined
@@ -560,6 +575,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Seconds to pause after each completed trick so players can see the last card played (default: 2.5)",
     )
     parser.add_argument(
+        "--round-pause",
+        type=float,
+        default=4.0,
+        help=(
+            "Seconds to pause after each completed round (manche) so players can read the "
+            "end-of-round score recap before the next deal starts (default: 4.0)"
+        ),
+    )
+    parser.add_argument(
         "--log-level",
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
@@ -587,7 +611,13 @@ async def main(argv: list[str] | None = None) -> None:
     )
 
     async def _handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        await handle_connection(reader, writer, args.target_score, trick_pause_seconds=args.trick_pause)
+        await handle_connection(
+            reader,
+            writer,
+            args.target_score,
+            trick_pause_seconds=args.trick_pause,
+            round_pause_seconds=args.round_pause,
+        )
 
     server = await asyncio.start_server(_handler, args.host, args.port)
     bound = server.sockets[0].getsockname() if server.sockets else (args.host, args.port)

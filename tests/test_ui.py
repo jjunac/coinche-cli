@@ -220,6 +220,27 @@ def test_render_round_score_contains_totals_for_both_teams():
     assert panel.title == "Score de la manche"
 
 
+def test_render_round_score_with_contract_shows_result_and_untrusted_name_unparsed():
+    round_score = {
+        "NS": {"total": 162, "card_points": 152},
+        "EW": {"total": 0, "card_points": 10},
+    }
+    cumulative = {"NS": 162, "EW": 0}
+    contract = {
+        "trump": "♥",
+        "points": 90,
+        "bidder_name": MALICIOUS_NAME,
+        "attacking_team": "NS",
+        "result": "made",
+    }
+    panel = render_round_score(round_score, cumulative, local_team="NS", contract=contract)
+    assert panel.title == "Score de la manche"
+    console = Console(record=True, width=100)
+    console.print(panel)
+    output = console.export_text()
+    assert MALICIOUS_NAME in output
+
+
 def test_render_game_over_declares_correct_winner_label():
     final_scores = {"NS": 1010, "EW": 640}
     panel_win = render_game_over(final_scores, winning_team="NS", local_team="NS")

@@ -463,12 +463,25 @@ def render_update_notice(current_version: str, server_version: str) -> Panel:
 
 
 def render_round_score(
-    round_score: dict, cumulative: dict, local_team: str, team_names: dict[str, str] | None = None
+    round_score: dict,
+    cumulative: dict,
+    local_team: str,
+    team_names: dict[str, str] | None = None,
+    contract: dict | None = None,
 ) -> Panel:
+    """End-of-round recap: each team's points for the manche just played, the
+    updated cumulative score, and (if `contract` is given) whether the
+    announced contract was honored.
+
+    `contract`, when given, has the same shape as `render_game_over`'s:
+    {"trump": str, "points": int|"capot", "bidder_name": str (untrusted,
+    always wrapped via Text), "attacking_team": "NS"|"EW", "result":
+    "made"|"failed"|"capot_achieved"|"capot_failed"}.
+    """
     other_team = "EW" if local_team == "NS" else "NS"
     local_label = (team_names or {}).get(local_team) or "Nous"
     other_label = (team_names or {}).get(other_team) or "Eux"
-    lines = Group(
+    blocks = [
         Align.center(
             Text(
                 f"{local_label} : {round_score[local_team]['total']} pts "
@@ -489,8 +502,26 @@ def render_round_score(
                 style="bold white",
             )
         ),
-    )
-    return Panel(lines, title="Score de la manche", border_style="green")
+    ]
+
+    if contract is not None:
+        points_label = "Capot" if contract["points"] == "capot" else str(contract["points"])
+        camp = "nous" if contract["attacking_team"] == local_team else "eux"
+        contract_line = Text("Annonce : ", style="grey70")
+        contract_line.append(f"{points_label} {contract['trump']}", style=f"bold {TEAM_COLORS[camp]}")
+        contract_line.append(" par ", style="grey70")
+        contract_line.append(contract["bidder_name"], style="bold white")
+        result_text, result_style = _CONTRACT_RESULT_LABELS.get(
+            contract["result"], (contract["result"], "bold white")
+        )
+        blocks.append(Text(""))
+        blocks.append(Align.center(contract_line))
+        blocks.append(Align.center(Text(result_text, style=result_style)))
+
+    blocks.append(Text(""))
+    blocks.append(Align.center(Text("Prochaine donne dans un instant...", style="italic grey70")))
+
+    return Panel(Group(*blocks), title="Score de la manche", border_style="green")
 
 
 _CONTRACT_RESULT_LABELS: dict[str, tuple[str, str]] = {

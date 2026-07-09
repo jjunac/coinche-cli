@@ -36,10 +36,13 @@ NAMES_BY_SEAT = {"N": "Alice", "E": "Bob", "S": "Carol", "W": "Dave"}
 
 async def _start_server(target_score: int = 1000) -> tuple[asyncio.AbstractServer, int]:
     async def _handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        # trick_pause_seconds=0: these tests don't care about the UX pause
-        # after each trick (added per user request) and would otherwise take
-        # ~20s longer per full round played (8 tricks * 2.5s).
-        await server.handle_connection(reader, writer, target_score, trick_pause_seconds=0)
+        # trick_pause_seconds=0/round_pause_seconds=0: these tests don't care
+        # about the UX pauses after each trick/round (added per user request)
+        # and would otherwise take much longer per round played (8 tricks *
+        # 2.5s, plus 4s between rounds).
+        await server.handle_connection(
+            reader, writer, target_score, trick_pause_seconds=0, round_pause_seconds=0
+        )
 
     srv = await asyncio.start_server(_handler, HOST, 0)
     port = srv.sockets[0].getsockname()[1]
@@ -487,7 +490,7 @@ def test_trick_completion_pauses_before_next_play_request():
 
     async def scenario() -> None:
         async def _handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-            await server.handle_connection(reader, writer, 1000, trick_pause_seconds=0.3)
+            await server.handle_connection(reader, writer, 1000, trick_pause_seconds=0.3, round_pause_seconds=0)
 
         srv = await asyncio.start_server(_handler, HOST, 0)
         port = srv.sockets[0].getsockname()[1]
@@ -513,6 +516,51 @@ def test_trick_completion_pauses_before_next_play_request():
             await _read_until(conns[winner][0], protocol.PLAY_REQUEST)
             elapsed = asyncio.get_event_loop().time() - start
             assert elapsed >= 0.25, f"next play_request arrived too early ({elapsed:.3f}s < ~0.3s pause)"
+        finally:
+            for _reader, writer in conns.values():
+                writer.close()
+            srv.close()
+            await srv.wait_closed()
+
+    asyncio.run(scenario())
+
+
+def test_round_completion_pauses_before_next_deal():
+    """Per user request: after a round (manche) completes without ending the
+    game, the server must wait `round_pause_seconds` after broadcasting
+    ROUND_SCORE before dealing the next round, so every player has time to
+    read the end-of-round recap shown by the client."""
+
+    async def scenario() -> None:
+        async def _handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+            await server.handle_connection(reader, writer, 1000, trick_pause_seconds=0, round_pause_seconds=0.3)
+
+        srv = await asyncio.start_server(_handler, HOST, 0)
+        port = srv.sockets[0].getsockname()[1]
+        conns: dict = {}
+        try:
+            conns = await _join_all(port, "pause02")
+            observer_reader = conns["N"][0]
+
+            await _read_until(conns["W"][0], protocol.DEAL)
+            await _bid_min_and_finalize_contract(conns, observer_reader)
+
+            current_actor = "W"
+            for _ in range(8):
+                for _ in range(4):
+                    req = await _read_until(conns[current_actor][0], protocol.PLAY_REQUEST)
+                    card = req["legal_cards"][0]
+                    await _send(conns[current_actor][1], protocol.PLAY_CARD, {"card": card})
+                    await _read_until(observer_reader, protocol.CARD_PLAYED)
+                    current_actor = ROTATION_NEXT[current_actor]
+                trick_result = await _read_until(observer_reader, protocol.TRICK_RESULT)
+                current_actor = trick_result["winner_seat"]
+
+            start = asyncio.get_event_loop().time()
+            await _read_until(observer_reader, protocol.ROUND_SCORE)
+            await _read_until(observer_reader, protocol.DEAL)
+            elapsed = asyncio.get_event_loop().time() - start
+            assert elapsed >= 0.25, f"next deal arrived too early ({elapsed:.3f}s < ~0.3s pause)"
         finally:
             for _reader, writer in conns.values():
                 writer.close()
