@@ -14,6 +14,7 @@ import argparse
 import asyncio
 import sys
 from dataclasses import dataclass, field
+from typing import Callable
 
 from rich.live import Live
 from rich.text import Text
@@ -83,6 +84,13 @@ class ClientState:
     # screen instead; only one of the two is shown at a time.
     active_bid_request: dict | None = None
     active_bid_value_prompt: tuple[str, list] | None = None
+    # Point value typed so far for the stage-2 prompt above, echoed inline by
+    # `redraw()` instead of via the terminal's own line-input echo (see
+    # `_prompt_bid_value`): raw terminal echo happens outside Live's tracked
+    # console and desyncs its cursor-position bookkeeping, which is what
+    # caused stale table content to linger on screen.
+    bid_value_buffer: str = ""
+    bid_value_error: bool = False
     joined_once: bool = False
     game_over: bool = False
     # Populated on GAME_OVER (final cumulative scores/winner) and by the last
@@ -289,7 +297,13 @@ def _apply_message(state: ClientState, msg_type: str, payload: dict, action_even
             state.hand.remove(payload["card"])
 
     elif msg_type == protocol.TRICK_RESULT:
-        state.current_trick = {}
+        # Deliberately do NOT clear `current_trick` here: the server holds
+        # off sending the next PLAY_REQUEST for `trick_pause_seconds` after
+        # broadcasting this message specifically so players can see the
+        # completed trick on the table during that pause. The four played
+        # cards stay visible until the next message that actually carries a
+        # fresh `current_trick` (the next PLAY_REQUEST, or CARD_PLAYED)
+        # overwrites it, or a new DEAL clears it for the next round.
         state.last_trick = _trick_from_wire(payload["trick"])
         winner = Seat(payload["winner_seat"])
         who = state.players.get(winner, winner.value)
@@ -432,6 +446,13 @@ async def run_session(
                 bid_menu, _ = ui.render_bid_menu(
                     req["legal_actions"], req["current_highest_bid"], req["can_coinche"], req["can_surcoinche"]
                 )
+            if isinstance(bid_menu, Text) and state.active_bid_value_prompt is not None:
+                # Echo the point value typed so far (see `_prompt_bid_value`)
+                # right inside the same Live-tracked renderable instead of
+                # relying on the terminal's own line-input echo.
+                bid_menu.append(state.bid_value_buffer, style="bold white")
+                if state.bid_value_error:
+                    bid_menu.append("  \u26a0 valeur invalide", style="bold red")
             view = ui.build_table_view(
                 state.seat,
                 state.players,
@@ -519,7 +540,7 @@ async def run_session(
                     state.active_bid_value_prompt = (trump, req["legal_actions"])
                     redraw()
                     _, valid_points = ui.render_bid_value_prompt(trump, req["legal_actions"])
-                    points = await _prompt_bid_value(valid_points)
+                    points = await _prompt_bid_value(state, redraw, valid_points)
                     bid_payload = {"action": "bid", "trump": trump, "points": points}
                 elif choice is not None:
                     bid_payload = choice
@@ -636,16 +657,44 @@ async def _prompt_game_over_screen(live: Live, state: ClientState) -> str:
     return "rematch" if choice == "rematch" else "quit"
 
 
-async def _prompt_bid_value(valid_points: list[int | str]) -> int | str:
-    """Read the announced point value typed by hand (needs Enter), re-prompting on an
-    invalid value."""
+async def _prompt_bid_value(state: ClientState, redraw: Callable[[], None], valid_points: list[int | str]) -> int | str:
+    """Read the announced point value typed by hand (Enter submits), re-prompting on an
+    invalid value.
+
+    Reads raw keystrokes one at a time (cbreak mode via `_read_single_key`, same as
+    `_prompt_key_choice` — no terminal echo) and echoes the typed buffer back through
+    `state.bid_value_buffer`/`redraw()` (rendered inline by the bid-value prompt in
+    `redraw()`), instead of using `input()`. `input()`'s own prompt/line-echo writes
+    straight to the terminal outside of Live's tracked console, which desyncs its
+    cursor-position bookkeeping and leaves stale table content on screen — the same
+    class of bug fixed for the "invalid value" message below.
+    """
     valid_tokens = {str(p) for p in valid_points}
-    while True:
-        raw = await asyncio.to_thread(input, "> ")
-        token = raw.strip().lower()
-        if token in valid_tokens:
-            return int(token) if token.isdigit() else token
-        print("Valeur invalide, réessayez.")
+    state.bid_value_buffer = ""
+    state.bid_value_error = False
+    try:
+        while True:
+            key = await asyncio.to_thread(_read_single_key)
+            if not key:
+                # EOF (e.g. piped/closed stdin): fall back to the lowest legal value
+                # rather than looping forever.
+                return valid_points[0]
+            if key in ("\r", "\n"):
+                token = state.bid_value_buffer.strip().lower()
+                if token in valid_tokens:
+                    return int(token) if token.isdigit() else token
+                state.bid_value_error = True
+                state.bid_value_buffer = ""
+            elif key in ("\x7f", "\x08"):  # Backspace/Delete
+                state.bid_value_buffer = state.bid_value_buffer[:-1]
+                state.bid_value_error = False
+            elif key.isprintable():
+                state.bid_value_buffer += key
+                state.bid_value_error = False
+            redraw()
+    finally:
+        state.bid_value_buffer = ""
+        state.bid_value_error = False
 
 
 def _prompt_missing(args: argparse.Namespace) -> tuple[str, int, str, str, str | None]:
