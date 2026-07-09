@@ -16,8 +16,9 @@ JOIN = "join"
 BID = "bid"
 PLAY_CARD = "play_card"
 CHAT = "chat"
+REMATCH = "rematch"
 
-CLIENT_MESSAGE_TYPES = {JOIN, BID, PLAY_CARD, CHAT}
+CLIENT_MESSAGE_TYPES = {JOIN, BID, PLAY_CARD, CHAT, REMATCH}
 
 # --- Server -> Client message types -------------------------------------------
 
@@ -32,6 +33,7 @@ CARD_PLAYED = "card_played"
 TRICK_RESULT = "trick_result"
 ROUND_SCORE = "round_score"
 GAME_OVER = "game_over"
+NEW_GAME = "new_game"
 RESYNC = "resync"
 CONNECTION_STATUS = "connection_status"
 ERROR = "error"
@@ -48,6 +50,7 @@ SERVER_MESSAGE_TYPES = {
     TRICK_RESULT,
     ROUND_SCORE,
     GAME_OVER,
+    NEW_GAME,
     RESYNC,
     CONNECTION_STATUS,
     ERROR,

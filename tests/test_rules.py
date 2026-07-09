@@ -121,6 +121,31 @@ def test_legal_cards_under_trump_exception_when_partner_holds_highest_trump():
     assert result == hand  # free choice among trumps, no overtrump required
 
 
+def test_legal_cards_can_pisser_when_partner_is_master_via_led_suit():
+    # Partner (N) led 10♠ and is currently master (no trump played yet by
+    # anyone, E's 8♠ is lower). Player (S) is void of spades but holds
+    # trump (♦) — since their own partner is master, they are not obliged
+    # to cut and may freely discard any card, including non-trump ones.
+    hand = [Card("A", "♣"), Card("R", "♦"), Card("V", "♦")]
+    trick = [(Seat.N, Card("10", "♠")), (Seat.W, Card("8", "♠"))]
+    result = legal_cards_to_play(
+        hand, trick, "♦", "♠", player_seat=Seat.S, partner_seat=Seat.N
+    )
+    assert result == hand  # free discard ("pisser"), no obligation to cut
+
+
+def test_legal_cards_must_cut_when_opponent_is_master_via_led_suit():
+    # Opponent (E) currently holds the highest card of the led suit (no
+    # trump played yet); player (S) void of the led suit and holding trump
+    # must still cut.
+    hand = [Card("A", "♣"), Card("R", "♦"), Card("V", "♦")]
+    trick = [(Seat.N, Card("8", "♠")), (Seat.E, Card("10", "♠"))]
+    result = legal_cards_to_play(
+        hand, trick, "♦", "♠", player_seat=Seat.S, partner_seat=Seat.N
+    )
+    assert result == [Card("R", "♦"), Card("V", "♦")]
+
+
 # --- trick_winner --------------------------------------------------------------
 
 

@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from rich.live import Live
 from rich.text import Text
 
-from coinche import protocol, ui
+from coinche import __version__, protocol, ui
 from coinche.cards import Seat
 from coinche.game import TEAM_OF
 from coinche.rules import NONTRUMP_ORDER, TRUMP_ORDER
@@ -27,11 +27,12 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 BACKOFF_DELAYS = (1, 2, 4, 8, 16)
 
-# Suit order used only when displaying a hand, chosen so that black/red
-# suits alternate left to right (pique, cœur, trèfle, carreau) for
+# Suit colors and canonical within-color order used only when displaying a
+# hand, chosen so that black/red suits alternate left to right for
 # readability. This is distinct from `cards.SUITS`, which stays in its
 # original order for bid/trump enumeration elsewhere.
-HAND_SUIT_ORDER: tuple[str, ...] = ("♠", "♥", "♣", "♦")
+BLACK_SUITS: tuple[str, ...] = ("♠", "♣")
+RED_SUITS: tuple[str, ...] = ("♥", "♦")
 
 
 @dataclass
@@ -45,6 +46,10 @@ class ClientState:
     current_trick: dict[Seat, str] = field(default_factory=dict)
     last_trick: dict[Seat, str] = field(default_factory=dict)
     whose_turn: Seat | None = None
+    # Seat that dealt the current round, shown as a "(D)" marker on the table
+    # so players can tell at a glance who bids first (dealer.next()) once the
+    # bidding phase starts.
+    dealer_seat: Seat | None = None
     trump: str | None = None
     contract_points: str | int | None = None
     contract_bidder: Seat | None = None
@@ -71,6 +76,17 @@ class ClientState:
     pending_play_request: dict | None = None
     joined_once: bool = False
     game_over: bool = False
+    # Populated on GAME_OVER (final cumulative scores/winner) and by the last
+    # ROUND_SCORE seen before it (per-team contract_result etc.), so the end-
+    # of-game screen can show whether the last announcement was honored.
+    final_scores: dict[str, int] = field(default_factory=lambda: {"NS": 0, "EW": 0})
+    winning_team: str | None = None
+    last_round_score: dict[str, dict] | None = None
+    # Set once when the server reports a version different from ours (see
+    # `_apply_message`'s JOINED/RESYNC handling); `update_notice_shown` guards
+    # against printing the banner more than once per session.
+    server_version: str | None = None
+    update_notice_shown: bool = False
 
 
 def _players_from_wire(entries: list[dict]) -> dict[Seat, str]:
@@ -85,22 +101,53 @@ def _trump_label(trump: str) -> str:
     return trump
 
 
+def _hand_suit_order(suits_present: set[str]) -> tuple[str, ...]:
+    """Left-to-right suit display order for a hand containing `suits_present`,
+    chosen so that black/red suits alternate for readability.
+
+    With all 4 suits present, they interleave black/red/black/red. With only
+    1-2 suits present, alternation is moot so they're just grouped black-
+    before-red. But with exactly 3 suits present, one color necessarily has
+    only one suit ("the lone suit") while the other has two — naively
+    grouping black-then-red would put the two same-colored suits next to
+    each other (e.g. pique, cœur, carreau puts the two reds together).
+    Instead, the lone suit is placed in the middle, sandwiched between the
+    two same-colored suits, so colors still alternate."""
+
+    blacks = tuple(s for s in BLACK_SUITS if s in suits_present)
+    reds = tuple(s for s in RED_SUITS if s in suits_present)
+    if len(blacks) == 2 and len(reds) == 2:
+        return (blacks[0], reds[0], blacks[1], reds[1])
+    if len(blacks) == 2 and len(reds) == 1:
+        return (blacks[0], reds[0], blacks[1])
+    if len(reds) == 2 and len(blacks) == 1:
+        return (reds[0], blacks[0], reds[1])
+    return blacks + reds
+
+
 def _sort_hand(hand: list[str], trump: str | None) -> list[str]:
-    """Sort a hand strongest-to-weakest, left to right (grouped by suit, in
-    `HAND_SUIT_ORDER`, which alternates black/red suits for readability).
-    Before a trump is known (`trump=None`), every suit is ordered by its
-    non-trump strength. Once a trump is declared, that suit's cards use the
-    trump strength order instead, so the ranking of e.g. the Jack/9 changes
-    accordingly."""
+    """Sort a hand strongest-to-weakest, left to right (grouped by suit,
+    ordered by `_hand_suit_order` so black/red suits alternate for
+    readability — this ordering is purely a client-side display concern,
+    computed fresh from `hand`'s own suits each call, and never sent back to
+    the server, so it can't affect gameplay).
+    Before a trump is known (`trump=None`, i.e. during the bidding phase),
+    every suit is ordered using the *trump* strength order (J, 9, A, 10, K,
+    Q, 8, 7) rather than the plain-suit order — this lets the player evaluate
+    each suit as a candidate trump while bidding. Once a trump is declared,
+    only that suit keeps the trump strength order and the others fall back
+    to the non-trump order."""
 
     def rank_strength(rank: str, suit: str) -> int:
-        if suit == trump:
+        if trump is None or suit == trump:
             return TRUMP_ORDER.index(rank)
         return NONTRUMP_ORDER.index(rank)
 
+    suit_order = _hand_suit_order({card[-1] for card in hand})
+
     def sort_key(card: str) -> tuple[int, int]:
         rank, suit = card[:-1], card[-1]
-        return (HAND_SUIT_ORDER.index(suit), -rank_strength(rank, suit))
+        return (suit_order.index(suit), -rank_strength(rank, suit))
 
     return sorted(hand, key=sort_key)
 
@@ -151,6 +198,7 @@ def _apply_message(state: ClientState, msg_type: str, payload: dict, action_even
         state.players = _players_from_wire(payload["players"])
         state.team_of = {s: TEAM_OF[s] for s in state.players}
         state.status_message = f"En attente de joueurs ({len(state.players)}/4)..."
+        state.server_version = payload.get("server_version")
 
     elif msg_type == protocol.LOBBY_UPDATE:
         state.players = _players_from_wire(payload["players"])
@@ -170,6 +218,7 @@ def _apply_message(state: ClientState, msg_type: str, payload: dict, action_even
         state.current_bid_seat = None
         state.bid_marks = {}
         state.whose_turn = Seat(payload["first_bidder_seat"])
+        state.dealer_seat = Seat(payload["dealer_seat"])
         state.last_action = f"Nouvelle donne #{payload['round_number']} (donneur {payload['dealer_seat']})"
 
     elif msg_type == protocol.BID_REQUEST:
@@ -240,13 +289,25 @@ def _apply_message(state: ClientState, msg_type: str, payload: dict, action_even
 
     elif msg_type == protocol.ROUND_SCORE:
         state.cumulative_scores = payload["cumulative"]
+        state.last_round_score = {"NS": payload["team_NS"], "EW": payload["team_EW"]}
         state.last_action = "Score de la manche"
         state.whose_turn = None
 
     elif msg_type == protocol.GAME_OVER:
         state.game_over = True
+        state.final_scores = payload["final_scores"]
+        state.winning_team = payload["winning_team"]
         state.last_action = f"Partie terminée — vainqueur : {payload['winning_team']}"
         state.whose_turn = None
+        action_event.set()
+
+    elif msg_type == protocol.NEW_GAME:
+        state.game_over = False
+        state.final_scores = {"NS": 0, "EW": 0}
+        state.winning_team = None
+        state.last_round_score = None
+        state.cumulative_scores = {"NS": 0, "EW": 0}
+        state.last_action = "Nouvelle partie !"
 
     elif msg_type == protocol.RESYNC:
         state.joined_once = True
@@ -257,6 +318,7 @@ def _apply_message(state: ClientState, msg_type: str, payload: dict, action_even
         state.legal_cards = []
         state.current_trick = _trick_from_wire(payload["current_trick"])
         state.cumulative_scores = payload["cumulative_scores"]
+        state.server_version = payload.get("server_version")
         if state.seat not in state.players:
             state.players[state.seat] = state.players.get(state.seat, "Moi")
         state.team_of = {s: TEAM_OF[s] for s in Seat}
@@ -324,6 +386,9 @@ async def run_session(
     live.start()
 
     def redraw() -> None:
+        if state.server_version is not None and state.server_version != __version__ and not state.update_notice_shown:
+            state.update_notice_shown = True
+            live.console.print(ui.render_update_notice(__version__, state.server_version))
         if state.seat is None or not state.players:
             live.update(Text(state.status_message))
         else:
@@ -366,6 +431,7 @@ async def run_session(
                 contract_points=display_points,
                 contract_bidder_name=contract_bidder_name,
                 last_trick=state.last_trick,
+                dealer_seat=state.dealer_seat,
             )
             live.update(view)
         live.refresh()
@@ -391,31 +457,49 @@ async def run_session(
             action_event.clear()
 
             if state.game_over:
-                return
+                choice = await _prompt_game_over_screen(live, state)
+                if choice != "rematch":
+                    try:
+                        writer.close()
+                    except Exception:
+                        pass
+                    return
+                state.game_over = False
+                try:
+                    writer.write(protocol.encode(protocol.REMATCH, {}))
+                    await writer.drain()
+                except (ConnectionError, OSError):
+                    return
+                continue
             if reader.at_eof():
                 return
 
             if state.pending_bid_request is not None:
                 req = state.pending_bid_request
                 state.pending_bid_request = None
-                live.stop()
+                # Print the menu via `live.console` (not a bare `print()` after
+                # `live.stop()`): Live's console hooks interleaved prints so they're
+                # inserted permanently above the live-rendered table region, and the
+                # live region itself keeps updating in place on the next redraw().
+                # Stopping/restarting Live here instead baked in a full extra copy of
+                # the table on every bid prompt, which is why the previous table
+                # never seemed to get cleared (each bid left a stale frame behind).
                 menu_text, tokens = ui.render_bid_menu(
                     req["legal_actions"], req["current_highest_bid"], req["can_coinche"], req["can_surcoinche"]
                 )
-                print(menu_text)
+                live.console.print(menu_text)
                 choice = await _prompt_key_choice(tokens)
 
                 bid_payload: dict | None = None
                 if choice is not None and choice["action"] == "select_trump":
                     trump = choice["trump"]
                     prompt_text, valid_points = ui.render_bid_value_prompt(trump, req["legal_actions"])
-                    print(prompt_text)
+                    live.console.print(prompt_text)
                     points = await _prompt_bid_value(valid_points)
                     bid_payload = {"action": "bid", "trump": trump, "points": points}
                 elif choice is not None:
                     bid_payload = choice
 
-                live.start()
                 if bid_payload is None:
                     continue
                 try:
@@ -500,6 +584,29 @@ async def _prompt_key_choice(tokens: dict[str, object]) -> object | None:
             return None
         if key in tokens:
             return tokens[key]
+
+
+async def _prompt_game_over_screen(live: Live, state: ClientState) -> str:
+    """Print the end-of-game screen (final scores, whether the last contract was
+    honored, winner) and wait for the player to pick "Nouvelle partie" or
+    "Quitter". Returns "rematch" or "quit" (also "quit" if stdin closes)."""
+    local_team = state.team_of.get(state.seat, "NS") if state.seat is not None else "NS"
+    contract: dict | None = None
+    if state.contract_bidder is not None and state.last_round_score is not None:
+        attacking_team = state.team_of.get(state.contract_bidder, "NS")
+        round_score_for_attacker = state.last_round_score.get(attacking_team)
+        if round_score_for_attacker is not None:
+            contract = {
+                "trump": state.trump,
+                "points": state.contract_points,
+                "bidder_name": state.players.get(state.contract_bidder, state.contract_bidder.value),
+                "attacking_team": attacking_team,
+                "result": round_score_for_attacker["contract_result"],
+            }
+    screen = ui.render_game_over(state.final_scores, state.winning_team or "", local_team, contract)
+    live.console.print(screen)
+    choice = await _prompt_key_choice({"1": "rematch", "2": "quit"})
+    return "rematch" if choice == "rematch" else "quit"
 
 
 async def _prompt_bid_value(valid_points: list[int | str]) -> int | str:

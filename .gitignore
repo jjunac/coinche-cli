@@ -1,5 +1,7 @@
 # Byte-compiled / optimized files
 __pycache__/
+tests/__pycache__/
+coinche/__pycache__/
 *.py[cod]
 *$py.class
 

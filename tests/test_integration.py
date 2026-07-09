@@ -36,7 +36,10 @@ NAMES_BY_SEAT = {"N": "Alice", "E": "Bob", "S": "Carol", "W": "Dave"}
 
 async def _start_server(target_score: int = 1000) -> tuple[asyncio.AbstractServer, int]:
     async def _handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        await server.handle_connection(reader, writer, target_score)
+        # trick_pause_seconds=0: these tests don't care about the UX pause
+        # after each trick (added per user request) and would otherwise take
+        # ~20s longer per full round played (8 tricks * 2.5s).
+        await server.handle_connection(reader, writer, target_score, trick_pause_seconds=0)
 
     srv = await asyncio.start_server(_handler, HOST, 0)
     port = srv.sockets[0].getsockname()[1]
@@ -471,6 +474,101 @@ def test_oversized_line_is_rejected_gracefully_not_a_server_crash():
             assert mtype2 == protocol.JOINED
             writer2.close()
         finally:
+            srv.close()
+            await srv.wait_closed()
+
+    asyncio.run(scenario())
+
+
+def test_trick_completion_pauses_before_next_play_request():
+    """Per user request: after a trick completes, the server must wait
+    `trick_pause_seconds` before letting play continue (next play_request),
+    so every player has time to see the last card played."""
+
+    async def scenario() -> None:
+        async def _handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+            await server.handle_connection(reader, writer, 1000, trick_pause_seconds=0.3)
+
+        srv = await asyncio.start_server(_handler, HOST, 0)
+        port = srv.sockets[0].getsockname()[1]
+        conns: dict = {}
+        try:
+            conns = await _join_all(port, "pause01")
+            observer_reader = conns["N"][0]
+
+            await _read_until(conns["W"][0], protocol.DEAL)
+            await _bid_min_and_finalize_contract(conns, observer_reader)
+
+            current_actor = "W"
+            for _ in range(4):
+                req = await _read_until(conns[current_actor][0], protocol.PLAY_REQUEST)
+                card = req["legal_cards"][0]
+                await _send(conns[current_actor][1], protocol.PLAY_CARD, {"card": card})
+                await _read_until(observer_reader, protocol.CARD_PLAYED)
+                current_actor = ROTATION_NEXT[current_actor]
+
+            start = asyncio.get_event_loop().time()
+            trick_result = await _read_until(observer_reader, protocol.TRICK_RESULT)
+            winner = trick_result["winner_seat"]
+            await _read_until(conns[winner][0], protocol.PLAY_REQUEST)
+            elapsed = asyncio.get_event_loop().time() - start
+            assert elapsed >= 0.25, f"next play_request arrived too early ({elapsed:.3f}s < ~0.3s pause)"
+        finally:
+            for _reader, writer in conns.values():
+                writer.close()
+            srv.close()
+            await srv.wait_closed()
+
+    asyncio.run(scenario())
+
+
+def test_rematch_after_game_over_restarts_with_fresh_scores():
+    """Per user request: once GAME_OVER fires, any seated player can request a
+    rematch (REMATCH); the server resets cumulative scores/round number and
+    kicks off a brand-new game (NEW_GAME, then a normal deal/bid_request)
+    without requiring a fresh connection/join."""
+
+    async def scenario() -> None:
+        srv, port = await _start_server(target_score=1)  # any round finishes the game
+        conns: dict = {}
+        try:
+            conns = await _join_all(port, "rematch1")
+            observer_reader = conns["N"][0]
+
+            await _read_until(conns["W"][0], protocol.DEAL)
+            await _bid_min_and_finalize_contract(conns, observer_reader)
+
+            current_actor = "W"
+            for _ in range(8):
+                for _ in range(4):
+                    req = await _read_until(conns[current_actor][0], protocol.PLAY_REQUEST)
+                    card = req["legal_cards"][0]
+                    await _send(conns[current_actor][1], protocol.PLAY_CARD, {"card": card})
+                    await _read_until(observer_reader, protocol.CARD_PLAYED)
+                    current_actor = ROTATION_NEXT[current_actor]
+                trick_result = await _read_until(observer_reader, protocol.TRICK_RESULT)
+                current_actor = trick_result["winner_seat"]
+
+            await _read_until(observer_reader, protocol.ROUND_SCORE)
+            game_over = await _read_until(observer_reader, protocol.GAME_OVER)
+            assert game_over["winning_team"] in ("NS", "EW")
+
+            # N asks for a rematch.
+            await _send(conns["N"][1], protocol.REMATCH, {})
+
+            new_game = await _read_until(observer_reader, protocol.NEW_GAME)
+            assert new_game["target_score"] == 1
+
+            deal_payload = await _read_until(conns["W"][0], protocol.DEAL)
+            assert deal_payload["round_number"] == 1
+            assert deal_payload["dealer_seat"] == "N"
+            assert deal_payload["first_bidder_seat"] == "W"
+
+            bid_req = await _read_until(conns["W"][0], protocol.BID_REQUEST)
+            assert bid_req["legal_actions"]
+        finally:
+            for _reader, writer in conns.values():
+                writer.close()
             srv.close()
             await srv.wait_closed()
 

@@ -39,9 +39,18 @@ class ClientSession:
 class Table:
     """A single table's seats, connections, and game state."""
 
-    def __init__(self, table_key: str, target_score: int = rules.DEFAULT_TARGET_SCORE) -> None:
+    def __init__(
+        self,
+        table_key: str,
+        target_score: int = rules.DEFAULT_TARGET_SCORE,
+        trick_pause_seconds: float = 2.5,
+    ) -> None:
         self.table_key = table_key
         self.target_score = target_score
+        # How long the server waits after broadcasting a trick's result before
+        # moving play on (next play_request, or dealing the next round), so
+        # every player has time to see the last card played (per user request).
+        self.trick_pause_seconds = trick_pause_seconds
         self.lock = asyncio.Lock()
         self.seats: dict[Seat, ClientSession | None] = {seat: None for seat in SEAT_ORDER}
         self.game: Game | None = None
@@ -125,6 +134,14 @@ class Table:
         assert self.game is None
         self.seats[seat] = None
 
+    def restart_game(self) -> Game:
+        """Start a brand-new game at this table once the previous one has ended
+        (rematch). Resets cumulative scores/round number/dealer rotation back
+        to a fresh `Game`, keeping the same seated players."""
+        assert self.game is not None and self.game.game_over
+        self.game = Game(target_score=self.target_score)
+        return self.game
+
     async def broadcast(self, msg_type: str, payload: dict, exclude: Seat | None = None) -> None:
         data = protocol.encode(msg_type, payload)
         for seat, session in list(self.seats.items()):
@@ -153,8 +170,12 @@ class Table:
 TABLES: dict[str, Table] = {}
 
 
-def get_or_create_table(table_key: str, target_score: int = rules.DEFAULT_TARGET_SCORE) -> Table:
+def get_or_create_table(
+    table_key: str,
+    target_score: int = rules.DEFAULT_TARGET_SCORE,
+    trick_pause_seconds: float = 2.5,
+) -> Table:
     """Lazily create (on first join) or return the existing table for `table_key`."""
     if table_key not in TABLES:
-        TABLES[table_key] = Table(table_key, target_score=target_score)
+        TABLES[table_key] = Table(table_key, target_score=target_score, trick_pause_seconds=trick_pause_seconds)
     return TABLES[table_key]

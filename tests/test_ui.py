@@ -7,6 +7,7 @@ string, only ever wrapped via the plain rich.text.Text(value) constructor.
 
 from __future__ import annotations
 
+from rich.console import Console
 from rich.text import Text
 
 from coinche.cards import Seat
@@ -214,3 +215,21 @@ def test_render_game_over_declares_correct_winner_label():
     panel_lose = render_game_over(final_scores, winning_team="NS", local_team="EW")
     assert panel_win.title == "Partie terminée"
     assert panel_lose.title == "Partie terminée"
+
+
+def test_render_game_over_with_contract_shows_result_and_untrusted_name_unparsed():
+    final_scores = {"NS": 1010, "EW": 640}
+    contract = {
+        "trump": "♥",
+        "points": 90,
+        "bidder_name": MALICIOUS_NAME,
+        "attacking_team": "NS",
+        "result": "failed",
+    }
+    panel = render_game_over(final_scores, winning_team="NS", local_team="NS", contract=contract)
+    assert panel.title == "Partie terminée"
+    console = Console(record=True, width=100)
+    console.print(panel)
+    output = console.export_text()
+    assert MALICIOUS_NAME in output
+    assert "Annonce chutée" in output

@@ -9,7 +9,7 @@ import argparse
 import asyncio
 import re
 
-from coinche import protocol, rules
+from coinche import __version__, protocol, rules
 from coinche.cards import Card, Seat
 from coinche.game import IllegalBidError, IllegalCardError, NotYourTurnError
 from coinche.table import (
@@ -70,6 +70,7 @@ def _snapshot_to_wire(snapshot: dict, table_key: str) -> dict:
         "cumulative_scores": snapshot["cumulative_scores"],
         "round_number": snapshot["round_number"],
         "dealer_seat": _seat_to_str(snapshot["dealer_seat"]),
+        "server_version": __version__,
     }
 
 
@@ -201,6 +202,12 @@ async def _handle_play_result(table: Table, result: dict) -> None:
         },
     )
 
+    # Pause here (per user request) so every player has time to see the last
+    # card played before the table moves on (next play_request, or the next
+    # round's deal) -- otherwise the trick's four cards could be cleared from
+    # the table almost instantly.
+    await asyncio.sleep(table.trick_pause_seconds)
+
     if not result["round_complete"]:
         await _send_play_request(table, result["next_to_act"])
         return
@@ -263,9 +270,22 @@ async def _dispatch(table: Table, seat: Seat, msg_type: str, payload: dict) -> N
     elif msg_type == protocol.CHAT:
         await table.broadcast(protocol.CHAT, {"seat": _seat_to_str(seat), "text": payload["text"]})
 
+    elif msg_type == protocol.REMATCH:
+        # Only meaningful once the previous game has actually ended; a stray/
+        # duplicate rematch request (e.g. several players pressing it, or one
+        # arriving after another player's rematch already restarted the table)
+        # is silently ignored rather than restarting an in-progress game.
+        if game is None or not game.game_over:
+            return
+        table.restart_game()
+        await table.broadcast(protocol.NEW_GAME, {"target_score": table.target_score})
+        await _broadcast_deal(table)
+        assert table.game is not None
+        await _send_bid_request(table, table.game.next_to_act)
+
 
 async def _resolve_join(
-    reader: asyncio.StreamReader, writer: asyncio.StreamWriter, target_score: int
+    reader: asyncio.StreamReader, writer: asyncio.StreamWriter, target_score: int, trick_pause_seconds: float
 ) -> tuple[Table, Seat] | None:
     try:
         line = await reader.readline()
@@ -297,7 +317,7 @@ async def _resolve_join(
         await _send_error(writer, protocol.MALFORMED_MESSAGE, "player_name must not be empty")
         return None
 
-    table = get_or_create_table(table_key, target_score=target_score)
+    table = get_or_create_table(table_key, target_score=target_score, trick_pause_seconds=trick_pause_seconds)
 
     async with table.lock:
         reconnect_seat = table.find_disconnected_seat(player_name) if table.game is not None else None
@@ -337,7 +357,13 @@ async def _resolve_join(
         await table.send_to(
             seat,
             protocol.JOINED,
-            {"table_key": table_key, "seat": _seat_to_str(seat), "players": players, "target_score": table.target_score},
+            {
+                "table_key": table_key,
+                "seat": _seat_to_str(seat),
+                "players": players,
+                "target_score": table.target_score,
+                "server_version": __version__,
+            },
         )
         await table.broadcast(
             protocol.LOBBY_UPDATE,
@@ -352,12 +378,15 @@ async def _resolve_join(
 
 
 async def handle_connection(
-    reader: asyncio.StreamReader, writer: asyncio.StreamWriter, target_score: int
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    target_score: int,
+    trick_pause_seconds: float = 2.5,
 ) -> None:
     table: Table | None = None
     seat: Seat | None = None
     try:
-        joined = await _resolve_join(reader, writer, target_score)
+        joined = await _resolve_join(reader, writer, target_score, trick_pause_seconds)
         if joined is None:
             return
         table, seat = joined
@@ -415,6 +444,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=rules.DEFAULT_TARGET_SCORE,
         help=f"Cumulative score to win the game (default: {rules.DEFAULT_TARGET_SCORE})",
     )
+    parser.add_argument(
+        "--trick-pause",
+        type=float,
+        default=2.5,
+        help="Seconds to pause after each completed trick so players can see the last card played (default: 2.5)",
+    )
     return parser
 
 
@@ -422,7 +457,7 @@ async def main(argv: list[str] | None = None) -> None:
     args = build_arg_parser().parse_args(argv)
 
     async def _handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        await handle_connection(reader, writer, args.target_score)
+        await handle_connection(reader, writer, args.target_score, trick_pause_seconds=args.trick_pause)
 
     server = await asyncio.start_server(_handler, args.host, args.port)
     bound = server.sockets[0].getsockname() if server.sockets else (args.host, args.port)

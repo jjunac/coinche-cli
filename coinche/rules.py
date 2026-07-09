@@ -134,9 +134,11 @@ def legal_cards_to_play(
 ) -> list[Card]:
     """Return the subset of `hand` legal to play next.
 
-    Enforces: follow-suit -> must-trump -> must-overtrump -> under-trump
-    exception when the partner holds the trick's current highest trump ->
-    free discard fallback.
+    Enforces: follow-suit -> master-partner "pisser" exception (free discard
+    when void of the led suit and the partner is already master of the
+    trick) -> must-trump -> must-overtrump -> under-trump exception when the
+    partner holds the trick's current highest trump -> free discard
+    fallback.
     """
     if not current_trick:
         return list(hand)
@@ -155,6 +157,15 @@ def legal_cards_to_play(
 
     if same_suit_cards:
         return same_suit_cards
+
+    # Void of the led suit: no obligation to cut at all if the partner is
+    # already master of the trick (whether by holding the highest card of
+    # the led suit with no trump played yet, or the highest trump played so
+    # far) — the player may "pisser" (discard any card freely).
+    if partner_seat is not None and trick_winner(
+        current_trick, trump_suit, led_suit
+    ) == partner_seat:
+        return list(hand)
 
     trump_cards = [c for c in hand if c.suit == trump_suit]
     if not trump_cards:

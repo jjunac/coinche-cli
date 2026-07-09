@@ -50,10 +50,14 @@ def card_text(card: str | None) -> Text:
     return Text(card, style=color, justify="center")
 
 
-def player_panel(name: str, team: str, played: str | None, is_turn: bool, connected: bool = True) -> Panel:
+def player_panel(
+    name: str, team: str, played: str | None, is_turn: bool, connected: bool = True, is_dealer: bool = False
+) -> Panel:
     """A single seat's panel. `name` is untrusted and wrapped via Text(), never markup."""
     style = f"bold {TEAM_COLORS[team]}" + (" reverse" if is_turn else "")
     title = Text(name, style=style)
+    if is_dealer:
+        title.append(" (D)", style="bold yellow")
     if not connected:
         title.append(" (déconnecté)", style="dim red")
     body = Align.center(card_text(played), vertical="middle")
@@ -85,6 +89,7 @@ def build_table_layout(
     whose_turn: Seat | None,
     center: Panel | None = None,
     connection_status: dict[Seat, bool] | None = None,
+    dealer_seat: Seat | None = None,
 ) -> Table:
     """3x3 grid, rotated so `local_seat` always renders at the bottom ("south")."""
     connection_status = connection_status or {}
@@ -105,6 +110,7 @@ def build_table_layout(
             current_trick.get(seat),
             is_turn=(seat == whose_turn),
             connected=connection_status.get(seat, True),
+            is_dealer=(seat == dealer_seat),
         )
 
     grid.add_row(empty, panels.get("north", empty), empty)
@@ -199,7 +205,7 @@ def last_trick_grid(local_seat: Seat, last_trick: dict[Seat, str]) -> Panel | No
     grid.add_row(empty, cells.get("north", empty), empty)
     grid.add_row(cells.get("west", empty), empty, cells.get("east", empty))
     grid.add_row(empty, cells.get("south", empty), empty)
-    return Panel(grid, title="Dernier pli", border_style="grey50", padding=(0, 0), expand=False)
+    return Panel(grid, title="Dernier pli", border_style="grey50", padding=(0, 1), expand=False)
 
 
 def build_footer(
@@ -247,10 +253,18 @@ def build_table_view(
     contract_points: str | int | None = None,
     contract_bidder_name: str | None = None,
     last_trick: dict[Seat, str] | None = None,
+    dealer_seat: Seat | None = None,
 ) -> Group:
     """Compose the whole table view into one root renderable for rich.live.Live."""
     table_layout = build_table_layout(
-        local_seat, players, team_of, current_trick, whose_turn, center=center, connection_status=connection_status
+        local_seat,
+        players,
+        team_of,
+        current_trick,
+        whose_turn,
+        center=center,
+        connection_status=connection_status,
+        dealer_seat=dealer_seat,
     )
     waiting = waiting_for_text(whose_turn, players, team_of, local_seat)
     contract = contract_text(trump, contract_points, contract_bidder_name)
@@ -408,6 +422,18 @@ def render_connection_banner(name: str, status: str) -> Text:
     return text
 
 
+def render_update_notice(current_version: str, server_version: str) -> Panel:
+    """One-time banner shown when the client's version doesn't match the server's,
+    prompting the player to update (e.g. via `git pull`) before playing."""
+    text = Text()
+    text.append("⚠ Nouvelle version disponible ", style="bold yellow")
+    text.append(f"(vous : {current_version}, serveur : {server_version}).\n", style="grey70")
+    text.append("Mettez à jour le client (", style="grey70")
+    text.append("git pull", style="bold white")
+    text.append(") puis relancez-le pour éviter d'éventuels problèmes de compatibilité.", style="grey70")
+    return Panel(text, border_style="yellow", title="Mise à jour recommandée", title_align="left")
+
+
 def render_round_score(round_score: dict, cumulative: dict, local_team: str) -> Panel:
     other_team = "EW" if local_team == "NS" else "NS"
     lines = Group(
@@ -435,12 +461,35 @@ def render_round_score(round_score: dict, cumulative: dict, local_team: str) -> 
     return Panel(lines, title="Score de la manche", border_style="green")
 
 
-def render_game_over(final_scores: dict, winning_team: str, local_team: str) -> Panel:
+_CONTRACT_RESULT_LABELS: dict[str, tuple[str, str]] = {
+    "made": ("Annonce réussie", "bold green"),
+    "failed": ("Annonce chutée", "bold red3"),
+    "capot_achieved": ("Capot réussi", "bold green"),
+    "capot_failed": ("Capot chuté", "bold red3"),
+}
+
+
+def render_game_over(
+    final_scores: dict,
+    winning_team: str,
+    local_team: str,
+    contract: dict | None = None,
+) -> Panel:
+    """End-of-game screen: final cumulative score per team, the overall winner,
+    and (if `contract` is given) whether the very last round's announced
+    contract was honored, plus a prompt to start a new game or quit.
+
+    `contract`, when given, is {"trump": str, "points": int|"capot",
+    "bidder_name": str (untrusted, always wrapped via Text), "attacking_team":
+    "NS"|"EW", "result": "made"|"failed"|"capot_achieved"|"capot_failed"}
+    describing the last round played.
+    """
     other_team = "EW" if local_team == "NS" else "NS"
     won = winning_team == local_team
     result_label = "Victoire !" if won else "Défaite"
     style = "bold green" if won else "bold red3"
-    lines = Group(
+
+    blocks = [
         Align.center(Text(result_label, style=style)),
         Align.center(
             Text(
@@ -448,5 +497,23 @@ def render_game_over(final_scores: dict, winning_team: str, local_team: str) -> 
                 style="bold white",
             )
         ),
-    )
-    return Panel(lines, title="Partie terminée", border_style="gold3")
+    ]
+
+    if contract is not None:
+        points_label = "Capot" if contract["points"] == "capot" else str(contract["points"])
+        camp = "nous" if contract["attacking_team"] == local_team else "eux"
+        contract_line = Text("Dernière annonce : ", style="grey70")
+        contract_line.append(f"{points_label} {contract['trump']}", style=f"bold {TEAM_COLORS[camp]}")
+        contract_line.append(" par ", style="grey70")
+        contract_line.append(contract["bidder_name"], style="bold white")
+        result_text, result_style = _CONTRACT_RESULT_LABELS.get(
+            contract["result"], (contract["result"], "bold white")
+        )
+        blocks.append(Text(""))
+        blocks.append(Align.center(contract_line))
+        blocks.append(Align.center(Text(result_text, style=result_style)))
+
+    blocks.append(Text(""))
+    blocks.append(Align.center(Text("[1] Nouvelle partie     [2] Quitter", style="bold yellow")))
+
+    return Panel(Group(*blocks), title="Partie terminée", border_style="gold3")
