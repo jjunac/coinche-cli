@@ -49,6 +49,14 @@ python -m coinche.client [--host HOST] [--port PORT] [--table KEY] [--name NAME]
 
 Any flag you omit falls back to an interactive prompt at startup.
 
+Alternatively, `./run_client.sh` creates the `.venv` if it doesn't exist,
+activates it, installs/updates `requirements.txt` when needed, then launches
+the client — passing through any arguments you give it:
+
+```bash
+./run_client.sh --host 127.0.0.1 --port 8765 --table demo1 --name Alice
+```
+
 To play a full 4-player game, start the server once, then run the client
 4 times (in 4 terminals, or on 4 machines that can reach the server), giving
 each a distinct `--name` and the same `--table` key:
@@ -59,6 +67,8 @@ python -m coinche.client --host 127.0.0.1 --port 8765 --table demo1 --name Bob
 python -m coinche.client --host 127.0.0.1 --port 8765 --table demo1 --name Carol
 python -m coinche.client --host 127.0.0.1 --port 8765 --table demo1 --name Dave
 ```
+
+(or `./run_client.sh --table demo1 --name Alice`, etc.)
 
 Once all 4 seats are filled, the server deals a hand and the game begins.
 If a client's connection drops mid-game, relaunching it with the same
