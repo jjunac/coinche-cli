@@ -31,6 +31,7 @@ BIDDING_RESULT = "bidding_result"
 PLAY_REQUEST = "play_request"
 CARD_PLAYED = "card_played"
 TRICK_RESULT = "trick_result"
+TRICK_CLEARED = "trick_cleared"
 ROUND_SCORE = "round_score"
 GAME_OVER = "game_over"
 NEW_GAME = "new_game"
@@ -48,6 +49,7 @@ SERVER_MESSAGE_TYPES = {
     PLAY_REQUEST,
     CARD_PLAYED,
     TRICK_RESULT,
+    TRICK_CLEARED,
     ROUND_SCORE,
     GAME_OVER,
     NEW_GAME,

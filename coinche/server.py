@@ -55,7 +55,7 @@ def _trick_to_wire(trick: list[tuple[Seat, Card]]) -> list[dict]:
 
 def _players_summary(table: Table) -> list[dict]:
     return [
-        {"seat": _seat_to_str(seat), "name": session.name}
+        {"seat": _seat_to_str(seat), "name": session.name, "team_name": session.team_name}
         for seat, session in table.seats.items()
         if session is not None
     ]
@@ -68,12 +68,13 @@ def _bid_to_wire(bid: dict | None) -> dict | None:
     return {**bid, "seat": _seat_to_str(bid["seat"])}
 
 
-def _snapshot_to_wire(snapshot: dict, table_key: str) -> dict:
+def _snapshot_to_wire(snapshot: dict, table_key: str, table: Table) -> dict:
     current_highest_bid = _bid_to_wire(snapshot["current_highest_bid"])
     bid_history = [{**entry, "seat": _seat_to_str(entry["seat"])} for entry in snapshot["bid_history"]]
     return {
         "table_key": table_key,
         "seat": _seat_to_str(snapshot["seat"]),
+        "players": _players_summary(table),
         "hand": [_card_to_wire(c) for c in snapshot["hand"]],
         "phase": snapshot["phase"],
         "current_highest_bid": current_highest_bid,
@@ -281,6 +282,15 @@ async def _handle_play_result(table: Table, result: dict) -> None:
     # the table almost instantly.
     await asyncio.sleep(table.trick_pause_seconds)
 
+    # Tell every player the trick is over now, not just whoever acts next
+    # (per user request): `_send_play_request` below only targets the single
+    # seat leading the next trick, so without this broadcast the other three
+    # players would keep staring at the finished trick's four cards -- and
+    # their "Dernier pli" corner would stay stale -- until their own next
+    # turn, which can be several tricks later. Sending this to everyone lets
+    # all clients clear the table / promote `last_trick` in lockstep.
+    await table.broadcast(protocol.TRICK_CLEARED, {})
+
     if not result["round_complete"]:
         await _send_play_request(table, result["next_to_act"])
         return
@@ -416,7 +426,7 @@ async def _resolve_join(
             seat = reconnect_seat
             logger.info("[%s] RECONNEXION %s (%s)", table_key, player_name, _seat_to_str(seat))
             snapshot = table.reconnect(seat, writer)
-            await table.send_to(seat, protocol.RESYNC, _snapshot_to_wire(snapshot, table_key))
+            await table.send_to(seat, protocol.RESYNC, _snapshot_to_wire(snapshot, table_key, table))
             await table.broadcast(
                 protocol.CONNECTION_STATUS,
                 {"seat": _seat_to_str(seat), "name": player_name, "status": "reconnected"},

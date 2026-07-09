@@ -112,10 +112,29 @@ class ClientState:
     # against printing the banner more than once per session.
     server_version: str | None = None
     update_notice_shown: bool = False
+    # Team id ("NS"/"EW") -> the free-text label a player chose via `--team`,
+    # if any (see `_team_names_from_wire`); shown in place of "Nous"/"Eux"
+    # wherever a team is displayed.
+    team_names: dict[str, str] = field(default_factory=dict)
 
 
 def _players_from_wire(entries: list[dict]) -> dict[Seat, str]:
     return {Seat(p["seat"]): p["name"] for p in entries}
+
+
+def _team_names_from_wire(entries: list[dict]) -> dict[str, str]:
+    """Map team id ("NS"/"EW") to a player-chosen `team_name`, if any. When both
+    teammates supplied one, the first one seen (seat order) wins -- best-effort,
+    since they're expected to match (matched case-insensitively server-side in
+    `Table.add_player`)."""
+    team_names: dict[str, str] = {}
+    for p in entries:
+        name = p.get("team_name")
+        if not name:
+            continue
+        team = TEAM_OF[Seat(p["seat"])]
+        team_names.setdefault(team, name)
+    return team_names
 
 
 def _trick_from_wire(entries: list[dict]) -> dict[Seat, str]:
@@ -222,12 +241,14 @@ def _apply_message(state: ClientState, msg_type: str, payload: dict, action_even
         state.seat = Seat(payload["seat"])
         state.players = _players_from_wire(payload["players"])
         state.team_of = {s: TEAM_OF[s] for s in state.players}
+        state.team_names = _team_names_from_wire(payload["players"])
         state.status_message = f"En attente de joueurs ({len(state.players)}/4)..."
         state.server_version = payload.get("server_version")
 
     elif msg_type == protocol.LOBBY_UPDATE:
         state.players = _players_from_wire(payload["players"])
         state.team_of = {s: TEAM_OF[s] for s in state.players}
+        state.team_names = _team_names_from_wire(payload["players"])
         state.status_message = f"En attente de joueurs ({payload['seats_filled']}/4)..."
 
     elif msg_type == protocol.DEAL:
@@ -319,14 +340,25 @@ def _apply_message(state: ClientState, msg_type: str, payload: dict, action_even
         # broadcasting this message specifically so players can see the
         # completed trick big on the main table during that pause. Stash it
         # in `pending_last_trick` instead -- it's promoted to `last_trick`
-        # only once the next trick actually starts (see PLAY_REQUEST above),
-        # so the "Dernier pli" corner doesn't jump to this trick while it's
-        # still on display in the middle of the table.
+        # once `TRICK_CLEARED` (or the next `PLAY_REQUEST`) arrives, so the
+        # "Dernier pli" corner doesn't jump to this trick while it's still
+        # on display in the middle of the table.
         state.pending_last_trick = _trick_from_wire(payload["trick"])
         winner = Seat(payload["winner_seat"])
         who = state.players.get(winner, winner.value)
         state.last_action = f"Pli remporté par {who} (+{payload['points_won']} pts)"
         state.whose_turn = winner
+
+    elif msg_type == protocol.TRICK_CLEARED:
+        # Sent to every seat (not just whoever plays next) right after the
+        # post-trick pause ends, so all four players clear the table and
+        # promote `last_trick` at the same moment -- otherwise only the next
+        # player to act (via PLAY_REQUEST below) would update, leaving the
+        # other three looking at stale cards until their own next turn.
+        state.current_trick = {}
+        if state.pending_last_trick is not None:
+            state.last_trick = state.pending_last_trick
+            state.pending_last_trick = None
 
     elif msg_type == protocol.ROUND_SCORE:
         state.cumulative_scores = payload["cumulative"]
@@ -361,6 +393,9 @@ def _apply_message(state: ClientState, msg_type: str, payload: dict, action_even
         state.pending_last_trick = None
         state.cumulative_scores = payload["cumulative_scores"]
         state.server_version = payload.get("server_version")
+        if payload.get("players"):
+            state.players = _players_from_wire(payload["players"])
+            state.team_names = _team_names_from_wire(payload["players"])
         if state.seat not in state.players:
             state.players[state.seat] = state.players.get(state.seat, "Moi")
         state.team_of = {s: TEAM_OF[s] for s in Seat}
@@ -494,6 +529,7 @@ async def run_session(
                 last_trick=state.last_trick,
                 dealer_seat=state.dealer_seat,
                 bid_menu=bid_menu,
+                team_names=state.team_names,
             )
             live.update(view)
         live.refresh()
@@ -670,7 +706,9 @@ async def _prompt_game_over_screen(live: Live, state: ClientState) -> str:
                 "attacking_team": attacking_team,
                 "result": round_score_for_attacker["contract_result"],
             }
-    screen = ui.render_game_over(state.final_scores, state.winning_team or "", local_team, contract)
+    screen = ui.render_game_over(
+        state.final_scores, state.winning_team or "", local_team, contract, state.team_names
+    )
     live.console.print(screen)
     choice = await _prompt_key_choice({"1": "rematch", "2": "quit"})
     return "rematch" if choice == "rematch" else "quit"
@@ -768,7 +806,42 @@ async def main(argv: list[str] | None = None) -> None:
 
 
 def cli() -> None:
-    asyncio.run(main())
+    """Entry point. Catches Ctrl+C at the top level so the player gets a clean
+    "Au revoir" message instead of a raw asyncio KeyboardInterrupt traceback.
+
+    `run_session`'s own `try`/`finally` (`live.stop()`, closing the writer) still
+    runs first: `asyncio.run()` reacts to a KeyboardInterrupt raised while the
+    event loop is waiting by cancelling the still-suspended `main()` task in its
+    own `finally` block, which unwinds through `run_session`'s `finally` (a
+    `CancelledError` there) before the original `KeyboardInterrupt` is re-raised
+    out of `asyncio.run()` and caught here.
+
+    Also defensively restores the terminal's mode (`_read_single_key` puts it in
+    cbreak mode while awaiting a keystroke): if Ctrl+C lands while a background
+    thread is blocked inside that raw read, the thread can't be cancelled and
+    its own `finally` restoring the mode may not run before we exit, which would
+    otherwise leave the shell's terminal in a broken/no-echo state.
+    """
+    try:
+        import termios
+    except ImportError:
+        fd = None
+        original_settings = None
+    else:
+        try:
+            fd = sys.stdin.fileno()
+            original_settings: list | None = termios.tcgetattr(fd)
+        except (termios.error, ValueError):
+            fd = None
+            original_settings = None
+
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nInterrompu. À bientôt !")
+    finally:
+        if fd is not None and original_settings is not None:
+            termios.tcsetattr(fd, termios.TCSADRAIN, original_settings)
 
 
 if __name__ == "__main__":

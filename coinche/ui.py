@@ -213,15 +213,22 @@ def build_footer(
     waiting: Text | None = None,
     contract: Text | None = None,
     last_trick: Panel | None = None,
+    team_names: dict[str, str] | None = None,
 ) -> Table:
+    """`team_names` (team id -> untrusted free-text label) is only ever
+    embedded via an f-string into a `Text`/`Text.assemble` tuple, never parsed
+    as markup, so it's safe the same way other untrusted strings are handled
+    elsewhere in this module."""
     other_team = "EW" if local_team == "NS" else "NS"
+    local_label = (team_names or {}).get(local_team) or "Nous"
+    other_label = (team_names or {}).get(other_team) or "Eux"
     footer = Table.grid(expand=True, padding=(0, 2))
     footer.add_column(justify="left")
     footer.add_column(justify="right")
     scores = Text.assemble(
-        ("Nous ", f"bold {TEAM_COLORS['nous']}"),
+        (f"{local_label} ", f"bold {TEAM_COLORS['nous']}"),
         (f"{cumulative_scores.get(local_team, 0)}", "bold white"),
-        ("   Eux ", f"bold {TEAM_COLORS['eux']}"),
+        (f"   {other_label} ", f"bold {TEAM_COLORS['eux']}"),
         (f"{cumulative_scores.get(other_team, 0)}", "bold white"),
     )
     if last_trick is not None:
@@ -253,6 +260,7 @@ def build_table_view(
     last_trick: dict[Seat, str] | None = None,
     dealer_seat: Seat | None = None,
     bid_menu: Group | Text | None = None,
+    team_names: dict[str, str] | None = None,
 ) -> Group:
     """Compose the whole table view into one root renderable for rich.live.Live.
 
@@ -261,6 +269,10 @@ def build_table_view(
     prompt from `render_bid_value_prompt`) rendered inline as part of the
     persistent live view, right below the hand -- instead of being printed
     as a separate block above the live region.
+
+    `team_names`, when given, maps team id ("NS"/"EW") to a free-text label a
+    player chose (via `--team`); shown in the footer instead of "Nous"/"Eux"
+    for that team.
     """
     table_layout = build_table_layout(
         local_seat,
@@ -284,7 +296,9 @@ def build_table_view(
         blocks.append(Text(""))
         blocks.append(Align.center(bid_menu))
     blocks.append(Text(""))
-    blocks.append(build_footer(cumulative_scores, local_team, last_action, waiting, contract, last_trick_panel))
+    blocks.append(
+        build_footer(cumulative_scores, local_team, last_action, waiting, contract, last_trick_panel, team_names)
+    )
     return Group(*blocks)
 
 
@@ -448,26 +462,30 @@ def render_update_notice(current_version: str, server_version: str) -> Panel:
     return Panel(text, border_style="yellow", title="Mise à jour recommandée", title_align="left")
 
 
-def render_round_score(round_score: dict, cumulative: dict, local_team: str) -> Panel:
+def render_round_score(
+    round_score: dict, cumulative: dict, local_team: str, team_names: dict[str, str] | None = None
+) -> Panel:
     other_team = "EW" if local_team == "NS" else "NS"
+    local_label = (team_names or {}).get(local_team) or "Nous"
+    other_label = (team_names or {}).get(other_team) or "Eux"
     lines = Group(
         Align.center(
             Text(
-                f"Nous : {round_score[local_team]['total']} pts "
+                f"{local_label} : {round_score[local_team]['total']} pts "
                 f"(cartes : {round_score[local_team]['card_points']})",
                 style=f"bold {TEAM_COLORS['nous']}",
             )
         ),
         Align.center(
             Text(
-                f"Eux : {round_score[other_team]['total']} pts "
+                f"{other_label} : {round_score[other_team]['total']} pts "
                 f"(cartes : {round_score[other_team]['card_points']})",
                 style=f"bold {TEAM_COLORS['eux']}",
             )
         ),
         Align.center(
             Text(
-                f"Cumulé — Nous : {cumulative[local_team]}   Eux : {cumulative[other_team]}",
+                f"Cumulé — {local_label} : {cumulative[local_team]}   {other_label} : {cumulative[other_team]}",
                 style="bold white",
             )
         ),
@@ -488,6 +506,7 @@ def render_game_over(
     winning_team: str,
     local_team: str,
     contract: dict | None = None,
+    team_names: dict[str, str] | None = None,
 ) -> Panel:
     """End-of-game screen: final cumulative score per team, the overall winner,
     and (if `contract` is given) whether the very last round's announced
@@ -499,6 +518,8 @@ def render_game_over(
     describing the last round played.
     """
     other_team = "EW" if local_team == "NS" else "NS"
+    local_label = (team_names or {}).get(local_team) or "Nous"
+    other_label = (team_names or {}).get(other_team) or "Eux"
     won = winning_team == local_team
     result_label = "Victoire !" if won else "Défaite"
     style = "bold green" if won else "bold red3"
@@ -507,7 +528,7 @@ def render_game_over(
         Align.center(Text(result_label, style=style)),
         Align.center(
             Text(
-                f"Score final — Nous : {final_scores[local_team]}   Eux : {final_scores[other_team]}",
+                f"Score final — {local_label} : {final_scores[local_team]}   {other_label} : {final_scores[other_team]}",
                 style="bold white",
             )
         ),
