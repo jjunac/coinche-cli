@@ -16,7 +16,7 @@ dist/
 .venv/
 venv/
 env/
-
+py_tests/report*
 # Testing / coverage
 .pytest_cache/
 .coverage
