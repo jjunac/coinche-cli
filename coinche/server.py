@@ -308,8 +308,8 @@ async def _handle_play_result(table: Table, result: dict) -> None:
         "[%s] R%d FIN DE MANCHE score_manche NS=%d EW=%d cumul NS=%d EW=%d",
         table.table_key,
         game.round_number,
-        result["round_score"]["NS"],
-        result["round_score"]["EW"],
+        result["round_score"]["NS"]["total"],
+        result["round_score"]["EW"]["total"],
         result["cumulative_scores"]["NS"],
         result["cumulative_scores"]["EW"],
     )
