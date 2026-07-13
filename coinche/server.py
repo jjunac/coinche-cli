@@ -650,9 +650,11 @@ async def main(argv: list[str] | None = None) -> None:
     print(f"Coinche server listening on {bound[0]}:{port} (target score {args.target_score})")
 
     # Detect reachable addresses so players know where to connect. Both lookups
-    # are best-effort and run in a thread to avoid blocking the event loop.
-    lan_ip = await asyncio.to_thread(_detect_lan_ip)
-    public_ip = await asyncio.to_thread(_detect_public_ip)
+    # are best-effort and run in an executor to avoid blocking the event loop.
+    # (run_in_executor rather than asyncio.to_thread, which needs Python 3.9+.)
+    loop = asyncio.get_event_loop()
+    lan_ip = await loop.run_in_executor(None, _detect_lan_ip)
+    public_ip = await loop.run_in_executor(None, _detect_public_ip)
     if lan_ip:
         print(f"  LAN (same network) : {lan_ip}:{port}")
     if public_ip:
