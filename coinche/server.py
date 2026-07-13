@@ -9,6 +9,8 @@ import argparse
 import asyncio
 import logging
 import re
+import socket
+import urllib.request
 
 from coinche import __version__, protocol, rules
 from coinche.cards import Card, Seat
@@ -597,6 +599,29 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _detect_lan_ip() -> str | None:
+    """Best-effort local (LAN) IP, without any external call.
+
+    Opens a UDP socket "towards" a public address: no packet is actually sent,
+    but the OS picks the outbound interface, whose address we can read back.
+    """
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            return s.getsockname()[0]
+    except OSError:
+        return None
+
+
+def _detect_public_ip(timeout: float = 3.0) -> str | None:
+    """Best-effort public (internet) IP via an external HTTP query."""
+    try:
+        with urllib.request.urlopen("https://api.ipify.org", timeout=timeout) as resp:
+            return resp.read().decode("utf-8").strip() or None
+    except Exception:
+        return None
+
+
 async def main(argv: list[str] | None = None) -> None:
     args = build_arg_parser().parse_args(argv)
 
@@ -621,7 +646,20 @@ async def main(argv: list[str] | None = None) -> None:
 
     server = await asyncio.start_server(_handler, args.host, args.port)
     bound = server.sockets[0].getsockname() if server.sockets else (args.host, args.port)
-    print(f"Coinche server listening on {bound[0]}:{bound[1]} (target score {args.target_score})")
+    port = bound[1]
+    print(f"Coinche server listening on {bound[0]}:{port} (target score {args.target_score})")
+
+    # Detect reachable addresses so players know where to connect. Both lookups
+    # are best-effort and run in a thread to avoid blocking the event loop.
+    lan_ip = await asyncio.to_thread(_detect_lan_ip)
+    public_ip = await asyncio.to_thread(_detect_public_ip)
+    if lan_ip:
+        print(f"  LAN (same network) : {lan_ip}:{port}")
+    if public_ip:
+        print(f"  Internet (public)  : {public_ip}:{port}")
+        print("  (forward this port on your router for remote players)")
+    elif not lan_ip:
+        print("  (could not detect a network address)")
     async with server:
         await server.serve_forever()
 
