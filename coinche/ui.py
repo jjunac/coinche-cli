@@ -532,7 +532,7 @@ def render_round_score(
         blocks.append(Align.center(Text(result_text, style=result_style)))
 
     blocks.append(Text(""))
-    blocks.append(Align.center(Text("Prochaine donne dans un instant...", style="italic grey70")))
+    blocks.append(Align.center(Text("Appuyez sur une touche pour continuer...", style="bold yellow")))
 
     return Panel(Group(*blocks), title="Score de la manche", border_style="green")
 
