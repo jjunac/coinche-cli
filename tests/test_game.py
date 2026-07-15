@@ -125,7 +125,10 @@ def test_surcoinche_ends_bidding_and_starts_play():
 
 
 def test_a13_tie_break_sudden_death_then_resolves():
-    game = Game(target_score=100, initial_dealer=Seat.N)
+    # Under the "faits + demandés" model a made 80-contract with 90 card
+    # points is worth 90 (arrondi) + 80 = 170. Target is set to 170 so the
+    # first round lands exactly on a tie.
+    game = Game(target_score=170, initial_dealer=Seat.N)
 
     bidder = game.next_to_act
     attacking_team = TEAM_OF[bidder]
@@ -133,17 +136,22 @@ def test_a13_tie_break_sudden_death_then_resolves():
 
     _finalize_simple_contract(game, trump="♠", points=80)
     assert game.phase == "trick_play"
-    game.round_state.captured_points = {attacking_team: 100, defending_team: 52}
+    game.round_state.captured_points = {attacking_team: 90, defending_team: 72}
+    # Split the tricks (5/3) so the attackers do NOT sweep all 8 — a full
+    # sweep would upgrade the numeric contract to a capot bonus.
+    opponent = bidder.next()  # adjacent seats are on opposing teams (A2)
     game.round_state.trick_history = [
-        {"winner_seat": bidder, "trick": [], "points_won": 0} for _ in range(8)
+        {"winner_seat": bidder if i < 5 else opponent, "trick": [], "points_won": 0}
+        for i in range(8)
     ]
     game.round_state.tricks_played = 8
     game.round_state.belote_holder = None  # force determinism regardless of random deal
-    game.cumulative_scores = {attacking_team: 0, defending_team: 48}
+    # attackers score 170, defenders 70; pre-load so both land on 170.
+    game.cumulative_scores = {attacking_team: 0, defending_team: 100}
 
     result = game._finish_round()
-    assert result["game_over"] is False  # tied at 100 == 100 -> sudden death continues
-    assert game.cumulative_scores == {"NS": 100, "EW": 100}
+    assert result["game_over"] is False  # tied at 170 == 170 -> sudden death continues
+    assert game.cumulative_scores == {"NS": 170, "EW": 170}
     assert game.phase == "bidding"  # a new round was started automatically
 
     bidder2 = game.next_to_act
@@ -152,8 +160,10 @@ def test_a13_tie_break_sudden_death_then_resolves():
 
     _finalize_simple_contract(game, trump="♠", points=80)
     game.round_state.captured_points = {attacking_team2: 90, defending_team2: 10}
+    opponent2 = bidder2.next()
     game.round_state.trick_history = [
-        {"winner_seat": bidder2, "trick": [], "points_won": 0} for _ in range(8)
+        {"winner_seat": bidder2 if i < 5 else opponent2, "trick": [], "points_won": 0}
+        for i in range(8)
     ]
     game.round_state.tricks_played = 8
     game.round_state.belote_holder = None  # force determinism regardless of random deal

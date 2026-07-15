@@ -46,13 +46,23 @@ BID_STEP = 10
 CAPOT = "capot"
 ALLOWED_TRUMPS: tuple[str, ...] = SUITS
 
-CAPOT_BONUS = 250  # A8
+CAPOT_ANNOUNCE = 250  # points "demandés" for an announced capot
+CAPOT_POINTS = 252  # points "réalisés" when a capot is actually made
 COINCHE_MULTIPLIER = 2  # A9
 SURCOINCHE_MULTIPLIER = 4  # A9
 BELOTE_BONUS = 20  # A11
 DIX_DE_DER = 10  # last-trick bonus, folded into captured points by callers
 
 NORMAL_POOL = 162  # 152 card points + 10 dix-de-der (A10)
+CAPOT_TOTAL = CAPOT_ANNOUNCE + CAPOT_POINTS  # 502: value of an announced capot
+
+TRICKS_PER_ROUND = 8
+
+
+def round_to_nearest_ten(points: int) -> int:
+    """Round card points to the nearest multiple of 10 (mathematical rounding,
+    .5 rounds up): 94 -> 90, 68 -> 70, 46 -> 50, 45 -> 50, 44 -> 40."""
+    return (points + 5) // 10 * 10
 
 DEFAULT_TARGET_SCORE = 1000  # A12
 
@@ -232,6 +242,7 @@ def score_round(
     coinche_level: int,
     capot_result: bool | None,
     belote_holder: str | None,
+    attacker_tricks: int | None = None,
 ) -> dict[str, dict]:
     """Score a completed round.
 
@@ -241,10 +252,29 @@ def score_round(
     is 1 (no coinche), 2 (coinche), or 4 (surcoinche) (A9). `capot_result` is
     only meaningful when `bid["points"] == "capot"`: True if the attacking
     team won all 8 tricks, False otherwise. `belote_holder` is "NS"/"EW"/None.
+    `attacker_tricks` is the number of tricks the attacking team took — used to
+    upgrade a numeric contract to a capot bonus when they take all 8 tricks
+    without having announced it.
+
+    Scoring model ("points faits + points demandés"):
+
+    * Contrat réussi : preneurs = arrondi(points cartes) + demandé ;
+      adversaires = arrondi(leurs points cartes). Un capot réalisé (8 plis)
+      remplace les points cartes du preneur par 252, qu'il ait été annoncé ou
+      non.
+    * Contrat chuté : preneurs = 0 ; adversaires = (162 + demandé). Un capot
+      annoncé et chuté donne (502) aux adversaires.
+    * Coinche / surcoinche : la somme (demandé + chute) du camp gagnant est
+      doublée ou quadruplée. La belote n'est jamais multipliée et n'est comptée
+      qu'une seule fois.
+    * Belote : +20 au camp qui détient Roi+Dame d'atout, indépendamment de
+      l'issue du contrat.
+
+    Card points are rounded to the nearest 10 for both teams (see
+    `round_to_nearest_ten`); the +20 belote bonus is added after rounding.
     """
     attacking_team = bid["team"]
     defending_team = "EW" if attacking_team == "NS" else "NS"
-    pool = NORMAL_POOL
 
     belote_bonus = {"NS": 0, "EW": 0}
     if belote_holder is not None:
@@ -252,36 +282,58 @@ def score_round(
 
     capot_bonus = {"NS": 0, "EW": 0}
 
-    if bid["points"] == CAPOT:
-        if capot_result:
-            attacking_before_mult = CAPOT_BONUS
-            defending_before_mult = 0
-            contract_result = "capot_achieved"
-            capot_bonus[attacking_team] = CAPOT_BONUS
-        else:
-            attacking_before_mult = 0
-            defending_before_mult = pool
-            contract_result = "capot_failed"
+    is_capot_bid = bid["points"] == CAPOT
+    announced = CAPOT_ANNOUNCE if is_capot_bid else bid["points"]
+    attacker_made_capot = attacker_tricks == TRICKS_PER_ROUND
+
+    # The belote (+20) held by the attackers helps fulfil the contract:
+    # "La belote aide à accomplir le contrat" (spec).
+    attacker_belote = BELOTE_BONUS if belote_holder == attacking_team else 0
+
+    # Attacking-team base score before coinche multiplier (excludes belote).
+    if is_capot_bid:
+        contract_made = bool(capot_result)
     else:
         attacking_points = captured_points_by_team.get(attacking_team, 0)
-        if attacking_points >= bid["points"]:
-            attacking_before_mult = attacking_points
-            defending_before_mult = captured_points_by_team.get(defending_team, 0)
-            contract_result = "made"
+        contract_made = attacking_points + attacker_belote >= bid["points"]
+
+    if contract_made:
+        # Points réalisés by the attackers: a full capot is worth 252
+        # regardless of whether it was the announced contract.
+        if is_capot_bid or attacker_made_capot:
+            attacker_realized = CAPOT_POINTS
+            capot_bonus[attacking_team] = CAPOT_POINTS
         else:
-            attacking_before_mult = 0
-            defending_before_mult = pool
-            contract_result = "failed"
-
-    contract_succeeded = contract_result in ("made", "capot_achieved")
-    if contract_succeeded:
-        attacking_scored = attacking_before_mult * coinche_level
-        defending_scored = defending_before_mult
+            attacker_realized = round_to_nearest_ten(
+                captured_points_by_team.get(attacking_team, 0)
+            )
+        attacking_base = attacker_realized + announced
+        # Defenders keep their rounded card points (nothing on a made capot).
+        if is_capot_bid or attacker_made_capot:
+            defending_base = 0
+        else:
+            defending_base = round_to_nearest_ten(
+                captured_points_by_team.get(defending_team, 0)
+            )
+        contract_result = "capot_achieved" if is_capot_bid else "made"
+        winning_team = attacking_team
     else:
-        attacking_scored = 0
-        defending_scored = defending_before_mult * coinche_level
+        # Chute : les adversaires reçoivent la chute plus le contrat demandé.
+        # Pour un capot annoncé, la chute vaut 502 (déjà 252 + 250 demandés) :
+        # on n'ajoute donc pas `announced` une seconde fois.
+        if is_capot_bid:
+            defending_base = CAPOT_TOTAL
+        else:
+            defending_base = NORMAL_POOL + announced
+        attacking_base = 0
+        contract_result = "capot_failed" if is_capot_bid else "failed"
+        winning_team = defending_team
 
-    scored_by_team = {attacking_team: attacking_scored, defending_team: defending_scored}
+    base_by_team = {attacking_team: attacking_base, defending_team: defending_base}
+
+    # Coinche/surcoinche multiplies only the winning camp's base (belote excluded).
+    scored_by_team = dict(base_by_team)
+    scored_by_team[winning_team] = base_by_team[winning_team] * coinche_level
 
     result: dict[str, dict] = {}
     for team in ("NS", "EW"):

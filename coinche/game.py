@@ -409,12 +409,13 @@ class Game:
         contract = bid.current_highest_bid
         assert contract is not None
 
+        attacking_team = contract["team"]
+        attacker_tricks = sum(
+            1 for t in rs.trick_history if TEAM_OF[t["winner_seat"]] == attacking_team
+        )
         capot_result: bool | None = None
         if contract["points"] == rules.CAPOT:
-            attacking_team = contract["team"]
-            capot_result = all(
-                TEAM_OF[t["winner_seat"]] == attacking_team for t in rs.trick_history
-            )
+            capot_result = attacker_tricks == len(rs.trick_history)
 
         round_score = rules.score_round(
             rs.captured_points,
@@ -422,6 +423,7 @@ class Game:
             bid.coinche_level,
             capot_result,
             rs.belote_holder,
+            attacker_tricks,
         )
 
         for team in ("NS", "EW"):
