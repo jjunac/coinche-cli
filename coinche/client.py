@@ -312,10 +312,10 @@ def _apply_message(state: ClientState, msg_type: str, payload: dict, action_even
         state.whose_turn = Seat(payload["first_bidder_seat"])
         state.dealer_seat = Seat(payload["dealer_seat"])
         state.last_action = f"Nouvelle donne #{payload['round_number']} (donneur {payload['dealer_seat']})"
-        # The new deal means the round-over recap (if any was showing) is done
-        # being displayed -- the server only sends DEAL after pausing long
-        # enough for players to read it (see ROUND_SCORE below).
-        state.round_over_screen = False
+        # Deliberately do NOT clear `round_over_screen` here: the end-of-round
+        # recap stays on screen (holding this freshly-dealt state underneath it)
+        # until the local player presses a key to dismiss it (see input_loop),
+        # so the recap is never auto-hidden by the next deal arriving.
 
     elif msg_type == protocol.BID_REQUEST:
         state.pending_bid_request = payload
@@ -414,13 +414,16 @@ def _apply_message(state: ClientState, msg_type: str, payload: dict, action_even
         state.cumulative_scores = payload["cumulative"]
         state.last_round_score = {"NS": payload["team_NS"], "EW": payload["team_EW"]}
         state.last_round_contract = _build_last_round_contract(state)
-        # Shown in place of the normal table view until the next DEAL arrives
-        # (the server pauses in between so this has time to be read); skipped
-        # entirely if this round also ended the game (see GAME_OVER below),
-        # whose own recap screen already covers this same information.
+        # Shown in place of the normal table view until the local player
+        # presses a key to dismiss it (see input_loop) -- NOT auto-cleared by
+        # the next DEAL, so the recap never flashes by unread. Skipped entirely
+        # if this round also ended the game (see GAME_OVER below), whose own
+        # recap screen already covers this same information.
         state.round_over_screen = True
         state.last_action = "Score de la manche"
         state.whose_turn = None
+        # Wake input_loop so it can block on a keypress to dismiss the recap.
+        action_event.set()
 
     elif msg_type == protocol.GAME_OVER:
         state.game_over = True
@@ -652,6 +655,17 @@ async def run_session(
                 continue
             if reader.at_eof():
                 return
+
+            # End-of-round recap: hold it on screen until the local player
+            # presses any key (ROUND_SCORE woke us here). The next round may
+            # already have been dealt underneath it (state advanced silently,
+            # the recap stayed up), so once dismissed we fall through -- not
+            # `continue` -- to handle any pending bid/play request that arrived
+            # while the recap was showing.
+            if state.round_over_screen:
+                await asyncio.to_thread(_read_single_key)
+                state.round_over_screen = False
+                redraw()
 
             if state.pending_bid_request is not None:
                 req = state.pending_bid_request
