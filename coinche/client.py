@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import sys
+import time
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -100,6 +101,12 @@ class ClientState:
     bid_value_buffer: str = ""
     bid_value_error: bool = False
     joined_once: bool = False
+    # Every ERROR received from the server this session, as (timestamp, text)
+    # pairs (e.g. a rejected join -- invalid table key, name taken, table
+    # full -- or an in-game error like NOT_YOUR_TURN). Collected here so
+    # `run_session` can dump them all at the end instead of the client just
+    # vanishing silently when the server rejects the connection and hangs up.
+    errors: list[tuple[float, str]] = field(default_factory=list)
     game_over: bool = False
     # Populated on GAME_OVER (final cumulative scores/winner) and by the last
     # ROUND_SCORE seen before it (per-team contract_result etc.), so the end-
@@ -471,7 +478,9 @@ def _apply_message(state: ClientState, msg_type: str, payload: dict, action_even
         state.last_action = f"[chat] {who}: {payload['text']}"
 
     elif msg_type == protocol.ERROR:
-        state.last_action = f"Erreur : {payload.get('message', payload.get('code'))}"
+        text = payload.get("message") or payload.get("code") or "Erreur inconnue"
+        state.errors.append((time.time(), text))
+        state.last_action = f"Erreur : {text}"
 
 
 async def run_session(
@@ -713,6 +722,16 @@ async def run_session(
             await writer.wait_closed()
         except Exception:
             pass
+
+    # Dump every server ERROR from this session now that Live has been torn
+    # down (clean terminal). Covers both a rejected join -- where the client
+    # would otherwise just vanish silently -- and any in-game errors, so
+    # nothing the server complained about is lost.
+    if state.errors:
+        print("Erreurs signalées par le serveur :")
+        for ts, text in state.errors:
+            stamp = time.strftime("%H:%M:%S", time.localtime(ts))
+            print(f"  [{stamp}] {text}")
 
     if state.game_over:
         return "game_over"
