@@ -16,6 +16,7 @@ from coinche import __version__, protocol, rules
 from coinche.cards import Card, Seat
 from coinche.game import TEAM_OF, IllegalBidError, IllegalCardError, NotYourTurnError
 from coinche.table import (
+    TABLES,
     GameInProgressError,
     NameTakenError,
     Table,
@@ -61,6 +62,30 @@ def _players_summary(table: Table) -> list[dict]:
         for seat, session in table.seats.items()
         if session is not None
     ]
+
+
+def _tables_listing() -> list[dict]:
+    """Snapshot of every table's lobby state (pre-join query).
+
+    Read-only snapshot without locking -- data may be slightly stale
+    (e.g. a player joined moments ago) but that's fine for the picker.
+    """
+    listing: list[dict] = []
+    for _key, table in list(TABLES.items()):
+        seats_filled = sum(1 for s in table.seats.values() if s is not None)
+        listing.append(
+            {
+                "table_key": table.table_key,
+                "in_progress": table.game is not None,
+                "seats_filled": seats_filled,
+                "players": [
+                    {"seat": _seat_to_str(seat), "name": s.name, "team_name": s.team_name}
+                    for seat, s in table.seats.items()
+                    if s is not None
+                ],
+            }
+        )
+    return listing
 
 
 def _bid_to_wire(bid: dict | None) -> dict | None:
@@ -398,24 +423,39 @@ async def _resolve_join(
     trick_pause_seconds: float,
     round_pause_seconds: float,
 ) -> tuple[Table, Seat] | None:
-    try:
-        line = await reader.readline()
-    except ValueError:
-        # Line exceeded the StreamReader's length limit (oversized/malformed input).
-        await _send_error(writer, protocol.MALFORMED_MESSAGE, "Message too large")
-        return None
-    if not line:
-        return None
+    """Read messages from a fresh client connection until a JOIN arrives.
 
-    try:
-        msg_type, payload = protocol.decode(line)
-    except protocol.ProtocolError:
-        await _send_error(writer, protocol.MALFORMED_MESSAGE, "Expected a join message")
-        return None
+    LIST_TABLES is served inline (TABLE_LISTING reply) and the loop continues
+    so the same connection can then send JOIN -- no extra round trip needed.
+    """
+    while True:
+        try:
+            line = await reader.readline()
+        except ValueError:
+            await _send_error(writer, protocol.MALFORMED_MESSAGE, "Message too large")
+            return None
+        if not line:
+            return None
 
-    if msg_type != protocol.JOIN:
-        await _send_error(writer, protocol.MALFORMED_MESSAGE, "First message must be 'join'")
-        return None
+        try:
+            msg_type, payload = protocol.decode(line)
+        except protocol.ProtocolError:
+            await _send_error(writer, protocol.MALFORMED_MESSAGE, "Expected a join message")
+            return None
+
+        if msg_type == protocol.LIST_TABLES:
+            try:
+                writer.write(protocol.encode(protocol.TABLE_LISTING, {"tables": _tables_listing()}))
+                await writer.drain()
+            except (ConnectionError, OSError):
+                return None
+            continue
+
+        if msg_type != protocol.JOIN:
+            await _send_error(writer, protocol.MALFORMED_MESSAGE, "First message must be 'join'")
+            return None
+
+        break
 
     table_key = str(payload["table_key"]).lower()
     player_name = str(payload["player_name"]).strip()

@@ -2,10 +2,11 @@
 
 Run with: python -m coinche.client [--host HOST] [--port PORT] [--table KEY] [--name NAME]
                                     [--team TEAM_NAME]
-Any omitted value falls back to an interactive input() prompt. `--team` is
-optional: it's a free-text label (e.g. "A"/"B") shared with a teammate to try
-to be seated on the same team (best-effort; the server falls back to normal
-seating if that isn't possible).
+When --table and --team are omitted, the client connects, queries the server
+for existing tables (LIST_TABLES), shows an interactive picker with player
+names per table (in-progress tables are shown but locked), lets the player
+choose Equipe 1 or Equipe 2 (showing members already on each side), and
+joins.  --table/--team flags still bypass every interactive step (back-compat).
 """
 
 from __future__ import annotations
@@ -844,37 +845,157 @@ async def _prompt_bid_value(state: ClientState, redraw: Callable[[], None], vali
         state.bid_value_error = False
 
 
-def _prompt_missing(args: argparse.Namespace) -> tuple[str, int, str, str, str | None]:
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_PORT = 8765
+BACKOFF_DELAYS = (1, 2, 4, 8, 16)
+
+
+def _prompt_host_port(args: argparse.Namespace) -> tuple[str, int]:
     host = args.host or input(f"Adresse du serveur [{DEFAULT_HOST}]: ").strip() or DEFAULT_HOST
     if args.port is not None:
         port = args.port
     else:
         raw_port = input(f"Port [{DEFAULT_PORT}]: ").strip()
         port = int(raw_port) if raw_port else DEFAULT_PORT
-    table_key = args.table or input("Clé de table : ").strip()
-    player_name = args.name or input("Votre nom : ").strip()
+    return host, port
+
+
+async def _fetch_table_listing(host: str, port: int) -> list[dict]:
+    """Open a throwaway connection, query LIST_TABLES, close, return the table list."""
+    try:
+        reader, writer = await asyncio.open_connection(host, port)
+    except OSError as exc:
+        print(f"Impossible de se connecter à {host}:{port} ({exc})")
+        return []
+    try:
+        writer.write(protocol.encode(protocol.LIST_TABLES, {}))
+        await writer.drain()
+        line = await asyncio.wait_for(reader.readline(), timeout=5.0)
+        if not line:
+            return []
+        msg_type, payload = protocol.decode(line)
+        if msg_type != protocol.TABLE_LISTING:
+            return []
+        return payload["tables"]
+    except (ConnectionError, OSError, protocol.ProtocolError):
+        return []
+    finally:
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except Exception:
+            pass
+
+
+def _show_table_picker(tables: list[dict]) -> str:
+    """Interactive numbered table picker.  Returns the chosen table key."""
+    print("\nTables disponibles :")
+    options: list[dict] = []
+    for t in tables:
+        names = ", ".join(p["name"] for p in t["players"]) if t["players"] else "(vide)"
+        in_prog = t["in_progress"]
+        status = f" (en cours, {t['seats_filled']}/4)" if in_prog else f" ({t['seats_filled']}/4)"
+        idx = len(options) + 1
+        print(f"  {idx}) {t['table_key']}{status} \u2014 {names}")
+        options.append({"key": t["table_key"], "selectable": not in_prog})
+    print("  0) Cr\u00e9er une nouvelle table")
+    while True:
+        choice = input("Choix : ").strip()
+        if choice == "0":
+            key = _auto_generate_table_key(tables)
+            print(f"Nouvelle table : {key}")
+            return key
+        try:
+            idx = int(choice) - 1
+            if 0 <= idx < len(options) and options[idx]["selectable"]:
+                return options[idx]["key"]
+        except ValueError:
+            pass
+        print("Choix invalide.")
+
+
+def _auto_generate_table_key(existing_tables: list[dict]) -> str:
+    """Generate the next available 'Table N' key (displayed as 'Table N',
+    stored as lowercase alphanumeric 'tableN' for the server)."""
+    existing_keys = {t["table_key"].lower() for t in existing_tables}
+    n = 1
+    while True:
+        key = f"table{n}"
+        if len(key) <= 12 and key not in existing_keys:
+            return key
+        n += 1
+
+
+def _show_team_picker(table_entry: dict | None) -> str:
+    """Interactive team picker for a table.  Returns the chosen team label."""
+    equipes: dict[str, list[str]] = {"Equipe 1": [], "Equipe 2": []}
+    if table_entry is not None:
+        for p in table_entry["players"]:
+            tn = p.get("team_name")
+            if tn in equipes:
+                equipes[tn].append(p["name"])
+
+    print("\n\u00c9quipes :")
+    labels = ["Equipe 1", "Equipe 2"]
+    for i, label in enumerate(labels):
+        members = equipes[label]
+        full = len(members) >= 2
+        member_str = ", ".join(members) if members else "(libre)"
+        marker = " \U0001f512 compl\u00e8te" if full else ""
+        print(f"  {i + 1}) {label} \u2014 {member_str}{marker}")
+    while True:
+        choice = input("Choix : ").strip()
+        if choice in ("1", "2"):
+            label = labels[int(choice) - 1]
+            if len(equipes[label]) >= 2:
+                print("Cette \u00e9quipe est compl\u00e8te.")
+                continue
+            return label
+        print("Choix invalide.")
+
+
+async def _prompt_table_and_team(host: str, port: int, args: argparse.Namespace) -> tuple[str, str | None]:
+    """Interactive table + team selection.  Bypassed entirely when --table/--team are given."""
+    # --- table ---
+    if args.table is not None:
+        table_key = args.table
+        listing: list[dict] | None = None
+    else:
+        listing = await _fetch_table_listing(host, port)
+        if listing is None:
+            listing = []
+        table_key = _show_table_picker(listing)
+
+    # --- team ---
     if args.team is not None:
         team_name = args.team.strip() or None
     else:
-        team_name = input("Nom d'équipe (optionnel, ex: A/B) : ").strip() or None
-    return host, port, table_key, player_name, team_name
+        if listing is None:
+            listing = await _fetch_table_listing(host, port)
+        table_entry = next((t for t in listing if t["table_key"] == table_key), None)
+        team_name = _show_team_picker(table_entry)
+
+    return table_key, team_name
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Coinche network game client")
     parser.add_argument("--host", help="Server host/IP")
     parser.add_argument("--port", type=int, help="Server port")
-    parser.add_argument("--table", help="Table key")
+    parser.add_argument("--table", help="Table key (skips interactive table picker)")
     parser.add_argument("--name", help="Player name")
     parser.add_argument(
-        "--team", help="Team label (e.g. 'A'/'B') shared with a teammate to try to be seated together (best-effort)"
+        "--team",
+        help="Team label ('Equipe 1'/'Equipe 2'); skips interactive team picker",
     )
     return parser
 
 
 async def main(argv: list[str] | None = None) -> None:
     args = build_arg_parser().parse_args(argv)
-    host, port, table_key, player_name, team_name = _prompt_missing(args)
+    host, port = _prompt_host_port(args)
+    player_name = args.name or input("Votre nom : ").strip()
+    table_key, team_name = await _prompt_table_and_team(host, port, args)
 
     result = await run_session(host, port, table_key, player_name, team_name)
     if result == "not_joined":
