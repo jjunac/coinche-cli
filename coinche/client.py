@@ -15,6 +15,7 @@ import argparse
 import asyncio
 import sys
 import time
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
@@ -101,7 +102,7 @@ class ClientState:
     active_bid_value_prompt: tuple[str, list] | None = None
     # Point value typed so far for the stage-2 prompt above, echoed inline by
     # `redraw()` instead of via the terminal's own line-input echo (see
-    # `_prompt_bid_value`): raw terminal echo happens outside Live's tracked
+    # `_handle_bid_value_key`): raw terminal echo happens outside Live's tracked
     # console and desyncs its cursor-position bookkeeping, which is what
     # caused stale table content to linger on screen.
     bid_value_buffer: str = ""
@@ -139,6 +140,11 @@ class ClientState:
     # if any (see `_team_names_from_wire`); shown in place of "Nous"/"Eux"
     # wherever a team is displayed.
     team_names: dict[str, str] = field(default_factory=dict)
+    # Chat: split-pane state.
+    active_pane: str = "game"  # "game" or "chat"
+    chat_messages: deque[tuple[str, str, str | None]] = field(default_factory=lambda: deque(maxlen=20))
+    chat_buffer: str = ""
+    chat_error: bool = False
 
 
 def _players_from_wire(entries: list[dict]) -> dict[Seat, str]:
@@ -486,7 +492,8 @@ def _apply_message(state: ClientState, msg_type: str, payload: dict, action_even
     elif msg_type == protocol.CHAT:
         seat = Seat(payload["seat"])
         who = state.players.get(seat, seat.value)
-        state.last_action = f"[chat] {who}: {payload['text']}"
+        team = state.team_of.get(seat)
+        state.chat_messages.append((who, payload["text"], team))
 
     elif msg_type == protocol.ERROR:
         text = payload.get("message") or payload.get("code") or "Erreur inconnue"
@@ -526,7 +533,7 @@ async def run_session(host: str, port: int, table_key: str, player_name: str, te
         return "not_joined"
 
     action_event = asyncio.Event()
-    live = Live(auto_refresh=False, screen=False)
+    live = Live(auto_refresh=False, screen=True)
     live.start()
 
     def redraw() -> None:
@@ -583,7 +590,7 @@ async def run_session(host: str, port: int, table_key: str, player_name: str, te
                     req["legal_actions"], req["current_highest_bid"], req["can_coinche"], req["can_surcoinche"]
                 )
             if isinstance(bid_menu, Text) and state.active_bid_value_prompt is not None:
-                # Echo the point value typed so far (see `_prompt_bid_value`)
+                # Echo the point value typed so far (see `_handle_bid_value_key`)
                 # right inside the same Live-tracked renderable instead of
                 # relying on the terminal's own line-input echo.
                 bid_menu.append(state.bid_value_buffer, style="bold white")
@@ -614,7 +621,24 @@ async def run_session(host: str, port: int, table_key: str, player_name: str, te
                 bid_menu=bid_menu,
                 team_names=state.team_names,
             )
-            live.update(view)
+            game_focused = state.active_pane == "game"
+            left_border = "bold cyan" if game_focused else "grey50"
+            left_panel = ui.Panel(
+                view,
+                title=state.table_key or "",
+                title_align="left",
+                border_style=left_border,
+                expand=True,
+            )
+            local_team = state.team_of.get(state.seat, "NS") if state.seat else None
+            chat = ui.build_chat_panel(
+                state.chat_messages,
+                state.chat_buffer,
+                active=not game_focused,
+                error=state.chat_error,
+                local_team=local_team,
+            )
+            live.update(ui.build_split_view(left_panel, chat, state.active_pane, height=live.console.size.height))
         live.refresh()
 
     async def receiver_loop() -> None:
@@ -634,9 +658,6 @@ async def run_session(host: str, port: int, table_key: str, player_name: str, te
 
     async def input_loop() -> None:
         while True:
-            await action_event.wait()
-            action_event.clear()
-
             if state.game_over:
                 choice = await _prompt_game_over_screen(live, state)
                 if choice != "rematch":
@@ -652,86 +673,55 @@ async def run_session(host: str, port: int, table_key: str, player_name: str, te
                 except (ConnectionError, OSError):
                     return
                 continue
-            if reader.at_eof():
-                return
 
-            # End-of-round recap: hold it on screen until the local player
-            # presses any key (ROUND_SCORE woke us here). The next round may
-            # already have been dealt underneath it (state advanced silently,
-            # the recap stayed up), so once dismissed we fall through -- not
-            # `continue` -- to handle any pending bid/play request that arrived
-            # while the recap was showing.
+            # Race key read against action_event (session teardown signals EOF).
+            done, _ = await asyncio.wait(
+                [
+                    asyncio.ensure_future(asyncio.to_thread(_read_single_key)),
+                    asyncio.ensure_future(action_event.wait()),
+                ],
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for t in done:
+                t.cancel()
+            if action_event.is_set():
+                action_event.clear()
+                if reader.at_eof():
+                    return
+                continue
+            key = done.pop().result()
+
+            if not key:
+                return
             if state.round_over_screen:
-                await asyncio.to_thread(_read_single_key)
                 state.round_over_screen = False
                 redraw()
-
-            if state.pending_bid_request is not None:
+                continue
+            if key == "\t":
+                state.active_pane = "chat" if state.active_pane == "game" else "game"
+                redraw()
+                continue
+            if state.active_pane == "chat":
+                await _handle_chat_key(state, key, writer)
+                redraw()
+                continue
+            # Game pane: bid/play key dispatch.
+            if state.active_bid_request is not None:
+                if await _handle_bid_key(state, key, writer, redraw):
+                    continue
+            elif state.active_bid_value_prompt is not None:
+                if await _handle_bid_value_key(state, key, writer, redraw):
+                    continue
+            elif state.pending_bid_request is not None:
                 req = state.pending_bid_request
                 state.pending_bid_request = None
-                # Show the menu inline as part of the persistent live table
-                # view (via `state.active_bid_request`/`redraw()`) instead of
-                # printing a separately-baked-ANSI block above the live
-                # region: printing that pre-rendered string through
-                # `live.console.print` fed it back through Rich's markup
-                # parser, which corrupted the raw ANSI codes into literal
-                # "[38;5;244m"-style garbage text on screen.
                 state.active_bid_request = req
                 redraw()
-                _, tokens = ui.render_bid_menu(
-                    req["legal_actions"], req["current_highest_bid"], req["can_coinche"], req["can_surcoinche"]
-                )
-                choice = await _prompt_key_choice(tokens)
-
-                bid_payload: dict | None = None
-                if choice is not None and choice["action"] == "select_trump":
-                    trump = choice["trump"]
-                    state.active_bid_value_prompt = (trump, req["legal_actions"])
-                    redraw()
-                    _, valid_points = ui.render_bid_value_prompt(trump, req["legal_actions"])
-                    points = await _prompt_bid_value(state, redraw, valid_points)
-                    bid_payload = {"action": "bid", "trump": trump, "points": points}
-                elif choice is not None:
-                    bid_payload = choice
-
-                state.active_bid_request = None
-                state.active_bid_value_prompt = None
-                redraw()
-                if bid_payload is None:
-                    continue
-                try:
-                    writer.write(protocol.encode(protocol.BID, bid_payload))
-                    await writer.drain()
-                except (ConnectionError, OSError):
-                    return
-
             elif state.pending_play_request is not None:
                 state.pending_play_request = None
-                legal_cards = state.legal_cards
-                # Every card in hand gets a number (see redraw()'s
-                # legal_cards=state.hand above), so the player can attempt to
-                # play any card. An illegal choice is never sent to the
-                # server: it's rejected right here with a warning, and the
-                # same menu is shown again without a new server round trip.
-                while True:
-                    _, tokens = ui.render_play_menu(state.hand)
-                    choice = await _prompt_key_choice(tokens)
-                    if choice is None:
-                        state.legal_cards = []
-                        redraw()
-                        break
-                    if choice not in legal_cards:
-                        state.last_action = f"⚠ Impossible de jouer {choice} maintenant (carte non autorisée)."
-                        redraw()
-                        continue
-                    state.legal_cards = []
-                    redraw()
-                    try:
-                        writer.write(protocol.encode(protocol.PLAY_CARD, {"card": choice}))
-                        await writer.drain()
-                    except (ConnectionError, OSError):
-                        return
-                    break
+                redraw()
+            elif state.legal_cards:
+                await _handle_play_key(state, key, writer, redraw)
 
     try:
         redraw()
@@ -783,66 +773,144 @@ def _read_single_key() -> str:
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
 
-async def _prompt_key_choice(tokens: dict[str, object]) -> object | None:
-    """Read single keystrokes (no Enter) until a valid numbered token is pressed."""
-    while True:
-        key = await asyncio.to_thread(_read_single_key)
-        if not key:
-            return None
-        if key in tokens:
-            return tokens[key]
-
-
 async def _prompt_game_over_screen(live: Live, state: ClientState) -> str:
-    """Print the end-of-game screen (final scores, whether the last contract was
-    honored, winner) and wait for the player to pick "Nouvelle partie" or
-    "Quitter". Returns "rematch" or "quit" (also "quit" if stdin closes)."""
+    """Print the end-of-game screen and wait for the player to pick "1" (rematch) or "2" (quit).
+
+    This is the only remaining blocking prompt: game-over is full-screen and
+    doesn't participate in the split-pane Tab/Chat dispatch.  Returns
+    ``"rematch"`` or ``"quit"`` (also ``"quit"`` if stdin closes)."""
     local_team = state.team_of.get(state.seat, "NS") if state.seat is not None else "NS"
     contract = _build_last_round_contract(state)
     screen = ui.render_game_over(state.final_scores, state.winning_team or "", local_team, contract, state.team_names)
     live.console.print(screen)
-    choice = await _prompt_key_choice({"1": "rematch", "2": "quit"})
-    return "rematch" if choice == "rematch" else "quit"
+    while True:
+        key = await asyncio.to_thread(_read_single_key)
+        if not key:
+            return "quit"
+        if key == "1":
+            return "rematch"
+        if key == "2":
+            return "quit"
 
 
-async def _prompt_bid_value(state: ClientState, redraw: Callable[[], None], valid_points: list[int | str]) -> int | str:
-    """Read the announced point value typed by hand (Enter submits), re-prompting on an
-    invalid value.
+_MAX_CHAT_LEN = 256
 
-    Reads raw keystrokes one at a time (cbreak mode via `_read_single_key`, same as
-    `_prompt_key_choice` — no terminal echo) and echoes the typed buffer back through
-    `state.bid_value_buffer`/`redraw()` (rendered inline by the bid-value prompt in
-    `redraw()`), instead of using `input()`. `input()`'s own prompt/line-echo writes
-    straight to the terminal outside of Live's tracked console, which desyncs its
-    cursor-position bookkeeping and leaves stale table content on screen — the same
-    class of bug fixed for the "invalid value" message below.
-    """
-    valid_tokens = {str(p) for p in valid_points}
-    state.bid_value_buffer = ""
-    state.bid_value_error = False
-    try:
-        while True:
-            key = await asyncio.to_thread(_read_single_key)
-            if not key:
-                # EOF (e.g. piped/closed stdin): fall back to the lowest legal value
-                # rather than looping forever.
-                return valid_points[0]
-            if key in ("\r", "\n"):
-                token = state.bid_value_buffer.strip().lower()
-                if token in valid_tokens:
-                    return int(token) if token.isdigit() else token
-                state.bid_value_error = True
-                state.bid_value_buffer = ""
-            elif key in ("\x7f", "\x08"):  # Backspace/Delete
-                state.bid_value_buffer = state.bid_value_buffer[:-1]
-                state.bid_value_error = False
-            elif key.isprintable():
-                state.bid_value_buffer += key
-                state.bid_value_error = False
-            redraw()
-    finally:
+
+async def _handle_chat_key(state: ClientState, key: str, writer: asyncio.StreamWriter) -> None:
+    """Per-key dispatch for the chat pane (called from input_loop)."""
+    if key in ("\r", "\n"):
+        text = state.chat_buffer.strip()
+        if text:
+            try:
+                writer.write(protocol.encode(protocol.CHAT, {"text": text}))
+                await writer.drain()
+            except (ConnectionError, OSError):
+                pass
+        state.chat_buffer = ""
+        state.chat_error = False
+    elif key in ("\x7f", "\x08"):
+        state.chat_buffer = state.chat_buffer[:-1]
+        state.chat_error = False
+    elif key.isprintable() and len(state.chat_buffer) < _MAX_CHAT_LEN:
+        state.chat_buffer += key
+        state.chat_error = False
+    elif key.isprintable():
+        state.chat_error = True
+
+
+async def _handle_bid_key(
+    state: ClientState, key: str, writer: asyncio.StreamWriter, redraw: Callable[[], None]
+) -> bool:
+    """Per-key dispatch for stage-1 bid menu. Returns True if the key was consumed."""
+    req = state.active_bid_request
+    if req is None:
+        return False
+    _, tokens = ui.render_bid_menu(
+        req["legal_actions"], req["current_highest_bid"], req["can_coinche"], req["can_surcoinche"]
+    )
+    if key not in tokens:
+        return False
+    choice = tokens[key]
+    bid_payload: dict | None = None
+    if choice["action"] == "select_trump":
+        trump = choice["trump"]
+        state.active_bid_value_prompt = (trump, req["legal_actions"])
         state.bid_value_buffer = ""
         state.bid_value_error = False
+        redraw()
+        return True
+    bid_payload = choice
+    state.active_bid_request = None
+    state.active_bid_value_prompt = None
+    redraw()
+    if bid_payload is not None:
+        try:
+            writer.write(protocol.encode(protocol.BID, bid_payload))
+            await writer.drain()
+        except (ConnectionError, OSError):
+            pass
+    return True
+
+
+async def _handle_bid_value_key(
+    state: ClientState, key: str, writer: asyncio.StreamWriter, redraw: Callable[[], None]
+) -> bool:
+    """Per-key dispatch for stage-2 bid value prompt. Returns True if the key was consumed."""
+    if state.active_bid_value_prompt is None:
+        return False
+    trump, legal_actions = state.active_bid_value_prompt
+    _, valid_points = ui.render_bid_value_prompt(trump, legal_actions)
+    valid_tokens = {str(p) for p in valid_points}
+    if key in ("\r", "\n"):
+        token = state.bid_value_buffer.strip().lower()
+        if token in valid_tokens:
+            points = int(token) if token.isdigit() else token
+            bid_payload = {"action": "bid", "trump": trump, "points": points}
+            state.active_bid_request = None
+            state.active_bid_value_prompt = None
+            redraw()
+            try:
+                writer.write(protocol.encode(protocol.BID, bid_payload))
+                await writer.drain()
+            except (ConnectionError, OSError):
+                pass
+            return True
+        state.bid_value_error = True
+        state.bid_value_buffer = ""
+        redraw()
+        return True
+    if key in ("\x7f", "\x08"):
+        state.bid_value_buffer = state.bid_value_buffer[:-1]
+        state.bid_value_error = False
+        redraw()
+        return True
+    if key.isprintable():
+        state.bid_value_buffer += key
+        state.bid_value_error = False
+        redraw()
+        return True
+    return False
+
+
+async def _handle_play_key(
+    state: ClientState, key: str, writer: asyncio.StreamWriter, redraw: Callable[[], None]
+) -> None:
+    """Per-key dispatch for play card selection."""
+    _, tokens = ui.render_play_menu(state.hand)
+    if key not in tokens:
+        return
+    choice = tokens[key]
+    if choice not in state.legal_cards:
+        state.last_action = f"⚠ Impossible de jouer {choice} maintenant (carte non autorisée)."
+        redraw()
+        return
+    state.legal_cards = []
+    redraw()
+    try:
+        writer.write(protocol.encode(protocol.PLAY_CARD, {"card": choice}))
+        await writer.drain()
+    except (ConnectionError, OSError):
+        pass
 
 
 DEFAULT_HOST = "127.0.0.1"

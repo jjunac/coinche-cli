@@ -365,6 +365,12 @@ async def _handle_play_result(table: Table, result: dict) -> None:
 
 
 async def _dispatch(table: Table, seat: Seat, msg_type: str, payload: dict) -> None:
+    # Chat works in the lobby as well as mid-game; handle it before the
+    # game-is-None guard that otherwise drops all game-phase messages.
+    if msg_type == protocol.CHAT:
+        await table.broadcast(protocol.CHAT, {"seat": _seat_to_str(seat), "text": payload["text"]})
+        return
+
     game = table.game
     if game is None:
         return  # ignore game-phase messages while still in the lobby
@@ -397,9 +403,6 @@ async def _dispatch(table: Table, seat: Seat, msg_type: str, payload: dict) -> N
             await table.send_to(seat, protocol.ERROR, {"code": protocol.ILLEGAL_CARD, "message": str(exc)})
             return
         await _handle_play_result(table, result)
-
-    elif msg_type == protocol.CHAT:
-        await table.broadcast(protocol.CHAT, {"seat": _seat_to_str(seat), "text": payload["text"]})
 
     elif msg_type == protocol.REMATCH:
         # Only meaningful once the previous game has actually ended; a stray/
@@ -697,11 +700,15 @@ async def main(argv: list[str] | None = None) -> None:
     public_ip = await loop.run_in_executor(None, _detect_public_ip)
     if lan_ip:
         print(f"  LAN (same network) : {lan_ip}:{port}")
+        print(f"    -> ./run_client.sh --host {lan_ip} --port {port}")
     if public_ip:
         print(f"  Internet (public)  : {public_ip}:{port}")
+        print(f"    -> ./run_client.sh --host {public_ip} --port {port}")
         print("  (forward this port on your router for remote players)")
     elif not lan_ip:
         print("  (could not detect a network address)")
+    if not lan_ip and not public_ip:
+        print(f"  (clients can connect with: ./run_client.sh --host <IP> --port {port})")
     async with server:
         await server.serve_forever()
 

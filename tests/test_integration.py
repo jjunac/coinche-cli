@@ -873,3 +873,48 @@ def test_list_tables_shows_team_names_per_player():
             await srv.wait_closed()
 
     asyncio.run(scenario())
+
+
+def test_chat_works_in_lobby():
+    """CHAT messages are delivered while fewer than 4 players are seated.
+
+    Regression: _dispatch used to early-return on game-is-None, silently
+    dropping all CHAT messages before the table was full.
+    """
+
+    async def scenario():
+        srv, port = await _start_server()
+        try:
+            r1, w1 = await _connect(port)
+            await _send(w1, protocol.JOIN, {"table_key": "chat0", "player_name": "Alice"})
+            joined1 = await _read_until(r1, protocol.JOINED)
+            seat1 = joined1["seat"]
+
+            r2, w2 = await _connect(port)
+            await _send(w2, protocol.JOIN, {"table_key": "chat0", "player_name": "Bob"})
+            await _read_until(r2, protocol.JOINED)
+
+            # Drain LOBBY_UPDATE broadcast from r1
+            while True:
+                mtype, _ = await _recv(r1)
+                if mtype == protocol.LOBBY_UPDATE:
+                    break
+
+            # Alice sends a chat
+            await _send(w1, protocol.CHAT, {"text": "hello from lobby"})
+
+            # Both players receive it
+            chat1 = await _read_until(r1, protocol.CHAT)
+            assert chat1["seat"] == seat1
+            assert chat1["text"] == "hello from lobby"
+
+            chat2 = await _read_until(r2, protocol.CHAT)
+            assert chat2["seat"] == seat1
+            assert chat2["text"] == "hello from lobby"
+        finally:
+            w1.close()
+            w2.close()
+            srv.close()
+            await srv.wait_closed()
+
+    asyncio.run(scenario())
