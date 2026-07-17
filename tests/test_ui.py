@@ -341,7 +341,6 @@ def test_build_chat_panel_name_not_parsed_as_markup():
 
 def test_build_split_view_has_two_columns():
     from rich.layout import Layout
-
     from rich.text import Text
 
     left = Text("left")
