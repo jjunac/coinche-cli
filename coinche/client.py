@@ -145,9 +145,10 @@ class ClientState:
     team_names: dict[str, str] = field(default_factory=dict)
     # Chat: split-pane state.
     active_pane: str = "game"  # "game" or "chat"
-    chat_messages: deque[tuple[str, str, str | None]] = field(default_factory=lambda: deque(maxlen=20))
+    chat_messages: deque[tuple[str, str, str | None, float]] = field(default_factory=lambda: deque(maxlen=20))
     chat_buffer: str = ""
     chat_error: bool = False
+    chat_cursor: int = 0
 
 
 def _players_from_wire(entries: list[dict]) -> dict[Seat, str]:
@@ -496,7 +497,7 @@ def _apply_message(state: ClientState, msg_type: str, payload: dict, action_even
         seat = Seat(payload["seat"])
         who = state.players.get(seat, seat.value)
         team = state.team_of.get(seat)
-        state.chat_messages.append((who, payload["text"], team))
+        state.chat_messages.append((who, payload["text"], team, time.time()))
 
     elif msg_type == protocol.ERROR:
         text = payload.get("message") or payload.get("code") or "Erreur inconnue"
@@ -652,6 +653,7 @@ async def run_session(
                 active=not game_focused,
                 error=state.chat_error,
                 local_team=local_team,
+                cursor=state.chat_cursor,
             )
             live.update(ui.build_split_view(left_panel, chat, state.active_pane, height=live.console.size.height))
         live.refresh()
@@ -846,7 +848,7 @@ async def _prompt_game_over_screen(live: Live, state: ClientState) -> str:
             return "quit"
 
 
-_MAX_CHAT_LEN = 256
+_MAX_CHAT_LEN = ui.MAX_CHAT_LEN
 
 
 async def _handle_chat_key(state: ClientState, key: str, writer: asyncio.StreamWriter) -> None:
@@ -860,12 +862,28 @@ async def _handle_chat_key(state: ClientState, key: str, writer: asyncio.StreamW
             except (ConnectionError, OSError):
                 pass
         state.chat_buffer = ""
+        state.chat_cursor = 0
         state.chat_error = False
     elif key in ("\x7f", "\x08"):
-        state.chat_buffer = state.chat_buffer[:-1]
+        if state.chat_cursor > 0:
+            state.chat_buffer = state.chat_buffer[: state.chat_cursor - 1] + state.chat_buffer[state.chat_cursor :]
+            state.chat_cursor -= 1
         state.chat_error = False
+    elif key == "left":
+        state.chat_cursor = max(0, state.chat_cursor - 1)
+    elif key == "right":
+        state.chat_cursor = min(len(state.chat_buffer), state.chat_cursor + 1)
+    elif key == "up":
+        state.chat_cursor = 0
+    elif key == "down":
+        state.chat_cursor = len(state.chat_buffer)
+    elif key == "\x01":
+        state.chat_cursor = 0
+    elif key == "\x05":
+        state.chat_cursor = len(state.chat_buffer)
     elif key.isprintable() and len(state.chat_buffer) < _MAX_CHAT_LEN:
-        state.chat_buffer += key
+        state.chat_buffer = state.chat_buffer[: state.chat_cursor] + key + state.chat_buffer[state.chat_cursor :]
+        state.chat_cursor += 1
         state.chat_error = False
     elif key.isprintable():
         state.chat_error = True

@@ -12,6 +12,7 @@ name or chat message.
 
 from __future__ import annotations
 
+import time
 from collections import deque
 
 from rich.align import Align
@@ -25,6 +26,8 @@ from coinche.cards import Seat
 
 RED_SUITS = {"♥", "♦"}
 TEAM_COLORS = {"nous": "cyan", "eux": "magenta"}
+
+MAX_CHAT_LEN = 256
 
 # Fixed counter-clockwise rotation order (A1), used to rotate the visual
 # layout so the local seat always renders at "south".
@@ -597,42 +600,66 @@ def render_game_over(
 
 
 def build_chat_panel(
-    messages: deque[tuple[str, str, str | None]],
+    messages: deque[tuple[str, str, str | None, float]],
     buffer: str,
     active: bool,
     error: bool = False,
     local_team: str | None = None,
+    cursor: int | None = None,
 ) -> Panel:
     """Right-side chat panel: message list + inline input buffer.
 
-    Each message is ``(name, text, team_id)`` where *team_id* is ``"NS"``/``"EW"``
-    or ``None``.  When *local_team* is given, the sender's name is coloured with
-    the matching ``TEAM_COLORS`` (``"nous"`` for same-team, ``"eux"`` for
-    opposite-team).
+    Each message is ``(name, text, team_id, ts)`` where *team_id* is
+    ``"NS"``/``"EW"`` or ``None`` and *ts* is a client-side receive timestamp
+    (``time.time()``).  When *local_team* is given, the sender's name is
+    coloured with the matching ``TEAM_COLORS`` (``"nous"`` for same-team,
+    ``"eux"`` for opposite-team).
+
+    When *active*, the input buffer is rendered with a reverse-video block
+    cursor at the position indicated by *cursor* (default: end of buffer).
 
     All player-supplied strings are wrapped via plain ``Text(value)`` to
     prevent rich-markup injection (see module docstring).
     """
+    if cursor is None:
+        cursor = len(buffer)
     _NAME_WIDTH = 10
     lines: list[RenderableType] = []
-    for name, text, team in messages:
+    for name, text, team, ts in messages:
         if team is not None and local_team is not None:
             camp = "nous" if team == local_team else "eux"
             name_style = f"bold {TEAM_COLORS[camp]}"
         else:
             name_style = "bold"
         line = Text(style="dim" if not active else "")
+        line.append(time.strftime("%H:%M", time.localtime(ts)), style="dim")
+        line.append(" ")
         line.append(name.ljust(_NAME_WIDTH), style=name_style)
-        line.append(": ", style=name_style if local_team is not None else "bold")
+        line.append(" ")
         line.append(text)
         lines.append(line)
     if not lines:
         lines.append(Text("  (aucun message)", style="italic grey50"))
     # Echo the typed buffer at the bottom
     prompt = Text("> ", style="bold green" if active else "grey50")
-    prompt.append(buffer, style="bold white")
+    if active:
+        before = buffer[:cursor]
+        after = buffer[cursor:]
+        if before:
+            prompt.append(before, style="bold white")
+        if after:
+            prompt.append(Text(after[0], style="reverse bold white"))
+            if len(after) > 1:
+                prompt.append(after[1:], style="bold white")
+        else:
+            prompt.append(Text(" ", style="reverse"))
+    else:
+        prompt.append(buffer, style="bold white")
     if error:
-        prompt.append("  ⚠ trop long", style="bold red")
+        prompt.append("  \u26a0 trop long", style="bold red")
+    if active and len(buffer) >= int(0.8 * MAX_CHAT_LEN):
+        count_style = "bold red" if error else "yellow"
+        prompt.append(f"  {len(buffer)}/{MAX_CHAT_LEN}", style=count_style)
     lines.append(prompt)
     border = "bold cyan" if active else "grey50"
     body = Group(*lines)

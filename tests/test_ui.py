@@ -297,9 +297,9 @@ def test_build_chat_panel_shows_placeholder_when_empty():
 def test_build_chat_panel_renders_messages():
     from collections import deque
 
-    msgs: deque[tuple[str, str, str | None]] = deque(maxlen=20)
-    msgs.append(("Alice", "bonjour", "NS"))
-    msgs.append(("Bob", "salut", "EW"))
+    msgs: deque[tuple[str, str, str | None, float]] = deque(maxlen=20)
+    msgs.append(("Alice", "bonjour", "NS", 1700000000.0))
+    msgs.append(("Bob", "salut", "EW", 1700000060.0))
     panel = build_chat_panel(msgs, buffer="", active=False, local_team="NS")
     plain = _plain(panel)
     assert "Alice" in plain
@@ -328,14 +328,73 @@ def test_build_chat_panel_active_border_differs():
 def test_build_chat_panel_name_not_parsed_as_markup():
     from collections import deque
 
-    msgs: deque[tuple[str, str, str | None]] = deque(maxlen=20)
-    msgs.append((MALICIOUS_NAME, "test", "NS"))
+    msgs: deque[tuple[str, str, str | None, float]] = deque(maxlen=20)
+    msgs.append((MALICIOUS_NAME, "test", "NS", 1700000000.0))
     panel = build_chat_panel(msgs, buffer="", active=False, local_team="NS")
     console = Console(record=True, width=100)
     console.print(panel)
     output = console.export_text()
     # The malicious markup must appear as literal text, not be parsed as rich markup.
     assert "[bold red]INJECTED[/bold red]" in output
+
+
+def test_build_chat_panel_renders_timestamp():
+    from collections import deque
+
+    msgs: deque[tuple[str, str, str | None, float]] = deque(maxlen=20)
+    msgs.append(("Alice", "bonjour", "NS", 1700000000.0))
+    panel = build_chat_panel(msgs, buffer="", active=False, local_team="NS")
+    plain = _plain(panel)
+    # 1700000000.0 is 2023-11-14 22:13:20 UTC; local time varies but HH:MM is always 5 chars
+    assert ":" in plain
+    assert "Alice" in plain
+
+
+def test_build_chat_panel_cursor_shown_when_active():
+    from collections import deque
+
+    panel = build_chat_panel(deque(maxlen=20), buffer="hi", active=True)
+    console = Console(record=True, width=100)
+    console.print(panel)
+    output = console.export_text()
+    assert "hi" in output
+    assert ">" in output
+
+
+def test_build_chat_panel_cursor_default_at_end():
+    from collections import deque
+
+    # Passing no cursor arg should render buffer with trailing cursor block
+    panel = build_chat_panel(deque(maxlen=20), buffer="ab", active=True)
+    plain = _plain(panel)
+    assert "ab" in plain
+    assert ">" in plain
+
+
+def test_build_chat_panel_cursor_in_middle():
+    from collections import deque
+
+    panel = build_chat_panel(deque(maxlen=20), buffer="abc", active=True, cursor=1)
+    plain = _plain(panel)
+    assert "abc" in plain
+
+
+def test_build_chat_panel_char_count_near_limit():
+    from collections import deque
+
+    long_buf = "a" * 210
+    panel = build_chat_panel(deque(maxlen=20), buffer=long_buf, active=True)
+    plain = _plain(panel)
+    assert "210/256" in plain
+
+
+def test_build_chat_panel_char_count_not_shown_when_inactive():
+    from collections import deque
+
+    long_buf = "a" * 210
+    panel = build_chat_panel(deque(maxlen=20), buffer=long_buf, active=False)
+    plain = _plain(panel)
+    assert "210/256" not in plain
 
 
 # --- Split view ----------------------------------------------------------------
